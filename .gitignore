@@ -1,0 +1,16 @@
+# Build directories
+build/
+cmake-build-*/
+*.so
+*.dylib
+*.dll
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
