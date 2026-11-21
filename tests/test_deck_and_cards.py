@@ -10,7 +10,7 @@ from conftest import (
 
 
 def test_abi_tensor_dimensions():
-    assert lib.joker_tensor_size() == 384
+    assert lib.joker_tensor_size() == 320
     assert lib.joker_oracle_tensor_size() == 160
     assert lib.joker_history_seq_len() == 48
     assert lib.joker_history_token_dim() == 8

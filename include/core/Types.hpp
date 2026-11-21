@@ -5,6 +5,31 @@
 #include <string_view>
 #include <utility>
 
+#if defined(__cpp_lib_unreachable) && __cpp_lib_unreachable >= 202202L
+#  define JOKER_UNREACHABLE() ::std::unreachable()
+#elif defined(_MSC_VER)
+#  define JOKER_UNREACHABLE() __assume(false)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define JOKER_UNREACHABLE() __builtin_unreachable()
+#else
+#  define JOKER_UNREACHABLE() ((void)0)
+#endif
+
+#if defined(__has_cpp_attribute)
+#  if __has_cpp_attribute(assume) >= 202207L
+#    define JOKER_ASSUME(expr) [[assume(expr)]]
+#  endif
+#endif
+#ifndef JOKER_ASSUME
+#  if defined(_MSC_VER)
+#    define JOKER_ASSUME(expr) __assume(expr)
+#  elif defined(__clang__)
+#    define JOKER_ASSUME(expr) __builtin_assume(expr)
+#  else
+#    define JOKER_ASSUME(expr) ((void)0)
+#  endif
+#endif
+
 namespace joker::core {
 
 constexpr int kNumPlayers = 4;
@@ -22,53 +47,71 @@ using HandMask = uint64_t;
 constexpr CardId kInvalidCard = 255;
 
 enum class MatchMode : uint8_t {
-    Long  = 0,
+    Long = 0,
     Short = 1
 };
 
 enum class RulePreset : uint8_t {
     Popular = 0,
-    Minus   = 1,
+    Minus = 1,
     Classic = 2
 };
 
 enum class TeamMode : uint8_t {
-    Solo  = 0,
+    Solo = 0,
     Pairs = 1
 };
 
 enum class PulkaMode : uint8_t {
     Strict = 0,
-    Soft   = 1
+    Soft = 1
 };
 
 enum class Suit : uint8_t {
-    Spades   = 0,
-    Clubs    = 1,
+    Spades = 0,
+    Clubs = 1,
     Diamonds = 2,
-    Hearts   = 3,
-    None     = 4
+    Hearts = 3,
+    None = 4
 };
 
 enum class Rank : uint8_t {
-    Six   = 0,
+    Six = 0,
     Seven = 1,
     Eight = 2,
-    Nine  = 3,
-    Ten   = 4,
-    Jack  = 5,
+    Nine = 3,
+    Ten = 4,
+    Jack = 5,
     Queen = 6,
-    King  = 7,
-    Ace   = 8,
+    King = 7,
+    Ace = 8,
     Joker = 9
 };
 
 enum class JokerAction : uint8_t {
-    None         = 0,
+    None = 0,
     LeadHighSuit = 1,
-    LeadLow      = 2,
-    PlayWin      = 3,
-    PlayLow      = 4
+    LeadLow = 2,
+    PlayWin = 3,
+    PlayLow = 4
+};
+
+enum class StepError : uint8_t {
+    Ok = 0,
+    NullHandle = 1,
+    MatchFinished = 2,
+    WaitingForDealInput = 3,
+    InvalidActionId = 4,
+    ForbiddenDealerBid = 5,
+    CardNotInHand = 6,
+    CardAlreadyPlayed = 7,
+    CardInOtherKnownHand = 8,
+    CardIsUpcard = 9,
+    MustFollowSuit = 10,
+    MustPlayTrump = 11,
+    MustPlayHighest = 12,
+    ViolatesKnownVoidOrBound = 13,
+    NoJokerAvailable = 14
 };
 
 constexpr std::string_view SuitToString(const Suit s) noexcept {
@@ -79,7 +122,7 @@ constexpr std::string_view SuitToString(const Suit s) noexcept {
         case Suit::Hearts:   return "♥";
         case Suit::None:     return "Б/К";
     }
-    std::unreachable();
+    JOKER_UNREACHABLE();
 }
 
 constexpr std::string_view RankToString(const Rank r) noexcept {
@@ -95,7 +138,7 @@ constexpr std::string_view RankToString(const Rank r) noexcept {
         case Rank::Ace:   return "A";
         case Rank::Joker: return "JK";
     }
-    std::unreachable();
+    JOKER_UNREACHABLE();
 }
 
 constexpr std::string_view MatchModeToString(const MatchMode m) noexcept {
@@ -103,7 +146,7 @@ constexpr std::string_view MatchModeToString(const MatchMode m) noexcept {
         case MatchMode::Long:  return "long";
         case MatchMode::Short: return "short";
     }
-    std::unreachable();
+    JOKER_UNREACHABLE();
 }
 
 constexpr std::string_view RulePresetToString(const RulePreset r) noexcept {
@@ -112,7 +155,7 @@ constexpr std::string_view RulePresetToString(const RulePreset r) noexcept {
         case RulePreset::Minus:   return "minus";
         case RulePreset::Classic: return "classic";
     }
-    std::unreachable();
+    JOKER_UNREACHABLE();
 }
 
 constexpr std::string_view TeamModeToString(const TeamMode t) noexcept {
@@ -120,7 +163,7 @@ constexpr std::string_view TeamModeToString(const TeamMode t) noexcept {
         case TeamMode::Solo:  return "solo";
         case TeamMode::Pairs: return "pairs";
     }
-    std::unreachable();
+    JOKER_UNREACHABLE();
 }
 
 constexpr std::string_view PulkaModeToString(const PulkaMode p) noexcept {
@@ -128,7 +171,7 @@ constexpr std::string_view PulkaModeToString(const PulkaMode p) noexcept {
         case PulkaMode::Strict: return "strict";
         case PulkaMode::Soft:   return "soft";
     }
-    std::unreachable();
+    JOKER_UNREACHABLE();
 }
 
 } // namespace joker::core

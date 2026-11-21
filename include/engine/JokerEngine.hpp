@@ -30,6 +30,20 @@ public:
                   core::TeamMode teamMode = core::TeamMode::Solo,
                   core::PulkaMode pulkaMode = core::PulkaMode::Strict) noexcept;
 
+    // Режим живого стола (Observed / Live Table Mode)
+    void BeginObservedMatch(core::RulePreset preset,
+                            core::MatchMode mode,
+                            core::TeamMode teamMode,
+                            core::PulkaMode pulkaMode,
+                            core::PlayerId dealer,
+                            core::PlayerId heroSeat) noexcept;
+
+    [[nodiscard]] bool SetObservedDeal(core::HandMask heroHandMask,
+                                       core::CardId upcardOrInvalid,
+                                       uint8_t trumpSuitOrNone) noexcept;
+
+    [[nodiscard]] bool SetObservedRemainingSix(core::HandMask fullNineHandMask) noexcept;
+
     void ForceDeckOrder(std::span<const core::CardId, core::kMaxDeckSize> customCards) noexcept {
         deck_.ForceDeckOrder(customCards);
     }
@@ -41,7 +55,12 @@ public:
     [[nodiscard]] core::PlayerId GetCurrentPlayer() const noexcept { return state_.currentPlayer; }
     [[nodiscard]] core::ActionMask GetLegalActionsMask() const noexcept;
 
+    [[nodiscard]] core::StepError ValidateAction(core::ActionId action) const noexcept {
+        return core::rules::ValidateActionForState(state_, action);
+    }
+
     bool Step(core::ActionId action) noexcept;
+    core::StepError StepChecked(core::ActionId action) noexcept;
 
     [[nodiscard]] const core::GameState& GetState() const noexcept { return state_; }
     [[nodiscard]] std::array<int32_t, 2> GetTeamScores() const noexcept {

@@ -1,85 +1,77 @@
 # Joker Core Engine (`C++23`)
 
-Высокопроизводительное, тривиально копируемое ядро карточной игры **«Джокер»** на стандарте **C++23** с нулевыми аллокациями в горячем цикле, многопоточной векторизацией (**OpenMP**) и чистым **C ABI** (`Zero-Copy`) для обучения с подкреплением и гибридного поиска (**PPO / IMPALA / MAPPO / AlphaZero / PIMC / IS-MCTS**).
+Высокопроизводительное, тривиально копируемое и кроссплатформенное ядро карточной игры **«Джокер»** на стандарте **C++23** с нулевыми аллокациями в горячем цикле, многопоточной векторизацией (**OpenMP**) и чистым **C ABI** (`Zero-Copy`).
+
+Подходит для **живого стола (Live Assistant)**, **массового RL-обучения (PPO / IMPALA / MAPPO / AlphaZero)**, **гибридного поиска (PIMC / IS-MCTS)** и **турнирной арены ботов**.
 
 ---
 
 ## Ключевые особенности
 
 * **Zero-Allocation & Trivially Copyable Core (`std::is_trivially_copyable_v<JokerEngine> == true`):**
-  Весь конечный автомат партии, состояние ГПСЧ `xoshiro256**` и колода занимают ~180 байт без динамической памяти (`new` / `std::vector`). Клонирование состояния для MCTS-симуляций сводится к одному `memcpy`.
-* **Cache-Line Aligned:**
-  * `GameState` выровнен по границе **128 байт** (`alignas(64)`, две кэш-линии L1).
-  * Слоты в `JokerVectorEnv` выровнены по **64 байта** (`alignas(64)`), что полностью исключает *False Sharing* при параллельном исполнении в потоках OpenMP.
-* **Zero-Copy C ABI:**
-  Тензоры наблюдений, битовые маски легальных ходов, Oracle-данные и токены истории пишутся напрямую в предварительно выделенные буферы NumPy / `torch.Tensor`.
+  Весь конечный автомат партии (`GameState` 192 байта + `Deck` с `xoshiro256**` и Lemire unbiased shuffle) занимает **320 байт** без динамической памяти. `EnvSlot` и `SlotStats` выровнены по 64 байтам (`alignas(64)`).
 * **24 ортогональные конфигурации правил (`3 × 2 × 2 × 2`):**
-  * **Пресеты правил (`RulePreset`):** `Popular` (36 карт, гадание на девятках, «все свои» 100×, штанга -200), `Minus` (36 карт, строгий штраф за недобор -100×), `Classic` (38 карт со всеми шестёрками, вскрытие козыря на девятках).
-  * **Длина партии (`MatchMode`):** `Long` (24 сдачи, 4 пульки `8+4+8+4`) и `Short` (8 сдач, 2 пульки `4+4` по 9 карт).
-  * **Командный режим (`TeamMode`):** `Solo` (каждый за себя) и `Pairs` (`P0 + P2` против `P1 + P3`).
-  * **Расчёт пульки (`PulkaMode`):** `Strict` (классическое списание и отмена премии) и `Soft` (соседский расчёт по игрокам «над» и «под» вами).
-* **Поддержка любых нейросетевых архитектур:**
-  * **MLP / ResNet:** эгоцентричный вектор наблюдения `384 float` (с раздельной экономикой для `Solo` и `Pairs`).
-  * **LSTM / Transformers:** хронологический буфер событий сдачи `[48, 8] int16` с зарезервированным `PAD = 0`.
-  * **Asymmetric Actor-Critic:** скрытый Oracle-тензор `160 float` с истинными картами всех 4 игроков.
-* **Гибридный поиск (PIMC / IS-MCTS + Batch NN):**
-  Встроенная детерминизация скрытых карт (`joker_clone_determinized`, `joker_vec_fork_from_env`) с гарантированным соблюдением вышедших карт, прикупа и известных ренонсов (`voidSuits`).
+  * `RulePreset`: `Popular`, `Minus`, `Classic` (36 или 38 карт);
+  * `MatchMode`: `Long` (24 сдачи) и `Short` (8 сдач по 9 карт);
+  * `TeamMode`: `Solo` и `Pairs` (`P0+P2` vs `P1+3`);
+  * `PulkaMode`: `Strict` и `Soft` (сосед «над вами» `over = (P + 3) % 4`).
+* **Режим живого стола (Observed Mode) + контроль честности + `Undo`:**
+  Поддержка частичной наблюдаемости (неизвестные руки соперников), валидация правил с 15 кодами `JokerStepError`, откат на 64 шага (`joker_undo`) и `DealHistoryBuffer` прямо в одиночной среде.
+* **Жёсткая логическая память (`impossibleCards`) и точная детерминизация:**
+  Отслеживание ренонсов и потолков рангов после хода Джокером `LeadHighSuit`; 3-проходная безаллокационная детерминизация (включая BFS по дополняющим циклам).
+* **Входной тензор v2 (`320 float`) + Oracle (`160 float`) + History (`[48, 8] int16`):**
+  Компактное SIMD-выровненное представление без абсолютных счетов — марковский горизонт будущего, контрфактические спреды пульки, потолки рангов и счётчик `master cards`.
+* **Встроенная C++ эвристика (`HeuristicBot`) и Арена (`JokerPlayerStats`):**
+  3-фазный бот (винрейт > 90% против случайного игрока во всех 3 пресетах), сбор полной статистики без блокировок и зеркальные турниры (`joker_vec_reset_with_seeds`, `joker_vec_set_auto_reset`).
 
 ---
 
-## Структура репозитория
+## Сборка (Desktop / Android / iOS / WebAssembly)
 
-```text
-joker-core/
-├── include/
-│   ├── core/
-│   │   ├── Types.hpp          # Константы и 4 ортогональных режима игры
-│   │   ├── Card.hpp           # Таблица карт (0..37) и битовые маски мастей
-│   │   ├── Action.hpp         # Пространство действий (0..45) и кодирование ходов
-│   │   ├── Deck.hpp           # xoshiro256** + тасование Лемира без modulo bias
-│   │   ├── Rules.hpp          # Легальные ходы, старшинство взяток (с Джокерами) и очки
-│   │   └── GameState.hpp      # 128-байтное состояние партии и проекция наблюдения (384 float)
-│   ├── engine/
-│   │   ├── JokerEngine.hpp    # Тривиально копируемый конечный автомат одной партии
-│   │   └── JokerVectorEnv.hpp # OpenMP-пул сред, буфер токенов истории, Oracle и Fork
-│   └── joker_c_api.h          # Чистый C ABI для Python / PyTorch / Rust / C#
-├── src/                       # Реализация ядра и C API
-├── tests/                     # Набор тестов и бенчмарков (pytest)
-├── CMakeLists.txt
-├── ENGINE.md                  # Подробная документация C API и раскладки тензоров
-└── RULES.md                   # Полное описание правил всех режимов игры
-```
+Требования: компилятор с **C++23** (`GCC 13+`, `Clang 16+`, `MSVC 2022+`) и **CMake 3.20+**.
 
----
-
-## Сборка
-
-Требования: компилятор с поддержкой **C++23** (`GCC 13+`, `Clang 16+`, `MSVC 2022+`), **CMake 3.20+** и **OpenMP**.
-
+### Desktop (Linux / macOS / Windows)
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+./build/joker_cli
 ```
 
-После сборки в директории `build/` появятся:
-* `libjoker_core.so` (или `.dylib` / `.dll`) — разделяемая библиотека с C ABI;
-* `joker_cli` — консольная утилита для быстрой проверки и отладки.
+### Кроссплатформенные опции CMake
+| Опция | По умолчанию | Назначение |
+| :--- | :---: | :--- |
+| `JOKER_ENABLE_OPENMP` | `ON` (`OFF` на iOS/WASM) | Многопоточность OpenMP в `JokerVectorEnv` |
+| `JOKER_NATIVE_ARCH` | `ON` (`OFF` при кросс-сборке) | Флаги `-march=native` / `/arch:AVX2` |
+| `JOKER_BUILD_SHARED` | `ON` (`OFF` на iOS/WASM) | Разделяемая (`.so`/`.dll`/`.dylib`) или статическая библиотека |
+| `JOKER_BUILD_CLI` | `ON` (`OFF` на мобильных/WASM) | Сборка утилиты `joker_cli` |
+
+Примеры кросс-сборки:
+```bash
+# Портативная сборка без -march=native
+cmake -B build-portable -DCMAKE_BUILD_TYPE=Release -DJOKER_NATIVE_ARCH=OFF
+cmake --build build-portable -j
+
+# WebAssembly (Emscripten)
+emcmake cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wasm -j
+```
 
 ---
 
-## Быстрый старт (Python + NumPy / PyTorch)
+## Быстрый старт (Python + NumPy)
 
 ```python
 import ctypes
 import numpy as np
 
 lib = ctypes.CDLL("./build/libjoker_core.so")
+lib.joker_tensor_size.restype = ctypes.c_size_t
+TENSOR_DIM = lib.joker_tensor_size()  # 320
 
-# Конфигурация: Popular (0), Long (0), Solo (0), Strict (0)
 NUM_ENVS = 1024
-vec = lib.joker_vec_create(NUM_ENVS, 0, 0, 0, 0, 42, 0)
+vec = lib.joker_vec_create(NUM_ENVS, 0, 0, 0, 0, 42, 0)  # Popular, Long, Solo, Strict
 
-obs = np.zeros((NUM_ENVS, 384), dtype=np.float32)
+obs = np.zeros((NUM_ENVS, TENSOR_DIM), dtype=np.float32)
 masks = np.zeros(NUM_ENVS, dtype=np.uint64)
 players = np.zeros(NUM_ENVS, dtype=np.uint8)
 rewards = np.zeros((NUM_ENVS, 4), dtype=np.float32)
@@ -87,7 +79,6 @@ deal_dones = np.zeros(NUM_ENVS, dtype=np.uint8)
 match_dones = np.zeros(NUM_ENVS, dtype=np.uint8)
 scores = np.zeros((NUM_ENVS, 4), dtype=np.int32)
 
-# Чтение начальных наблюдений (Zero-Copy)
 lib.joker_vec_get_observations(
     vec,
     obs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -96,7 +87,6 @@ lib.joker_vec_get_observations(
     None, None, None,
 )
 
-# Шаг батча
 actions = np.zeros(NUM_ENVS, dtype=np.uint8)  # выберите легальные биты из masks
 lib.joker_vec_step(
     vec,
@@ -118,23 +108,21 @@ lib.joker_vec_destroy(vec)
 
 ## Тестирование и бенчмарки
 
-Для запуска тестов необходимо предварительно собрать `libjoker_core.so`:
-
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install pytest numpy
 
-# Запуск юнит-тестов правил и тензоров
+# Юнит-тесты без бенчмарков
 pytest -v -m "not perf"
 
-# Запуск полного набора вместе с бенчмарками производительности
-pytest -v
+# Полный прогон вместе с бенчмарком производительности
+pytest -v -s
 ```
 
 ---
 
 ## Документация
 
-* **[ENGINE.md](ENGINE.md)** — детальная спецификация пространств действий (`0..45`), раскладки тензоров (`384 float`, `160 float`, `[48, 8] int16`), гибридного поиска (`IS-MCTS`) и всех функций `joker_c_api.h`.
-* **[RULES.md](RULES.md)** — исчерпывающее описание правил игры «Джокер» для всех пресетов, длин матчей, парного режима и режимов расчёта пульки.
+* **[ENGINE.md](ENGINE.md)** — спецификация канонических `ActionId` (`0..45`), раскладки тензора v2 (`320 float`), Oracle (`160 float`), истории (`[48, 8] int16`), Observed Mode и всего `joker_c_api.h`.
+* **[RULES.md](RULES.md)** — исчерпывающее описание правил игры «Джокер» для всех режимов.

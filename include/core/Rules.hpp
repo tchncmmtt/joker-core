@@ -20,6 +20,23 @@ constexpr bool HasNinesTrumpBidding(const RulePreset preset) noexcept {
     return preset != RulePreset::Classic;
 }
 
+// Вычисление пула потенциально возможных карт на руке игрока с неизвестной рукой (Observed Mode)
+constexpr HandMask ComputePossibleCardsForUnknownHand(
+    const GameState& state,
+    const PlayerId player) noexcept {
+    HandMask knownOtherHands = 0ULL;
+    for (PlayerId q = 0; q < kNumPlayers; ++q) {
+        if (q != player && state.IsHandKnown(q)) {
+            knownOtherHands |= state.hands[q];
+        }
+    }
+    const HandMask upcardMask = (state.upcard != kInvalidCard && state.upcard < kMaxDeckSize)
+        ? (1ULL << state.upcard)
+        : 0ULL;
+    const HandMask excluded = state.playedCardsHistory | knownOtherHands | upcardMask | state.impossibleCards[player];
+    return GetFullDeckMask(state.rules) & ~excluded;
+}
+
 namespace detail {
 
 constexpr ActionMask ComputeLegalActionsMask(
@@ -93,6 +110,20 @@ constexpr ActionMask ComputeLegalActionsMask(
 
 // 3. Генерация битовой маски легальных действий напрямую из GameState для заданного игрока
 constexpr ActionMask GetLegalActionsMaskForState(const GameState& state, const PlayerId player) noexcept {
+    if (state.phase == Phase::MatchFinished || state.IsWaitingForDealInput()) {
+        return 0ULL;
+    }
+
+    if (state.phase == Phase::TrickPlay && !state.IsHandKnown(player)) {
+        const HandMask possible = ComputePossibleCardsForUnknownHand(state, player);
+        const bool isLead = (state.cardsInCurrentTrick == 0);
+        ActionMask mask = possible & ~kJokerMask;
+        if ((possible & kJokerMask) != 0ULL) {
+            mask |= isLead ? kJokerLeadActionsMask : kJokerFollowActionsMask;
+        }
+        return mask;
+    }
+
     return detail::ComputeLegalActionsMask(
         state.phase,
         state.cardsInDeal,
@@ -119,12 +150,15 @@ constexpr ActionMask GetLegalActionsMask(const GameStateView& state) noexcept {
         state.trumpSuit);
 }
 
-// 4. Определение победителя взятки
-constexpr PlayerId DetermineTrickWinner(
+// 4. Определение победителя взятки (поддерживает и полную взятку count==4, и частичную count==1..3)
+constexpr PlayerId DetermineTrickWinnerN(
     const std::array<TrickCard, kNumPlayers>& trick,
+    const uint8_t count,
     const Suit trumpSuit) noexcept {
+    JOKER_ASSUME(count > 0 && count <= kNumPlayers);
+
     // Если кто-то сыграл Джокера на победу (PlayWin) — взятку забирает последний
-    for (int i = kNumPlayers - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(count) - 1; i >= 0; --i) {
         const auto& play = trick[i].play;
         if (GetCard(play.cardId).IsJoker() && play.jokerAction == JokerAction::PlayWin) {
             return trick[i].player;
@@ -141,7 +175,7 @@ constexpr PlayerId DetermineTrickWinner(
 
         if (trumpSuit != Suit::None && requestedSuit != trumpSuit) {
             bool trumped = false;
-            for (int i = 1; i < kNumPlayers; ++i) {
+            for (uint8_t i = 1; i < count; ++i) {
                 if (const Card& c = GetCard(trick[i].play.cardId); !c.IsJoker() && c.suit == trumpSuit) {
                     if (!trumped || c.rank > bestTrumpRank) {
                         trumped = true;
@@ -162,7 +196,7 @@ constexpr PlayerId DetermineTrickWinner(
     Rank winningRank = leadCard.rank;
     bool hasValidCardWinner = !leadCard.IsJoker();
 
-    for (int i = 1; i < kNumPlayers; ++i) {
+    for (uint8_t i = 1; i < count; ++i) {
         const CardPlay& play = trick[i].play;
         const Card& c = GetCard(play.cardId);
         if (c.IsJoker()) continue; // Джокер с PlayLow не берет
@@ -192,9 +226,15 @@ constexpr PlayerId DetermineTrickWinner(
     return winner;
 }
 
-// 5. Подсчет очков
+constexpr PlayerId DetermineTrickWinner(
+    const std::array<TrickCard, kNumPlayers>& trick,
+    const Suit trumpSuit) noexcept {
+    return DetermineTrickWinnerN(trick, static_cast<uint8_t>(kNumPlayers), trumpSuit);
+}
+
+// 5. Подсчет очков за сдачу
 constexpr int CalculateDealScore(const RulePreset preset,
-    const int bid, const int tricksTaken, const int numCards) noexcept {
+                                 const int bid, const int tricksTaken, const int numCards) noexcept {
     if (bid == 0 && tricksTaken == 0) {
         return 50;
     }
@@ -222,6 +262,136 @@ constexpr int CalculateDealScore(const RulePreset preset,
     }
 
     return 10 * tricksTaken;
+}
+
+// 6. Детальная валидация хода с кодом ошибки (для Live/Observed Mode и UI)
+constexpr StepError ValidateActionForState(const GameState& state, const ActionId action) noexcept {
+    if (state.phase == Phase::MatchFinished) {
+        return StepError::MatchFinished;
+    }
+    if (state.IsWaitingForDealInput()) {
+        return StepError::WaitingForDealInput;
+    }
+
+    const PlayerId p = state.currentPlayer;
+
+    if (state.phase == Phase::ChoosingTrump) {
+        return (action <= 4U) ? StepError::Ok : StepError::InvalidActionId;
+    }
+
+    if (state.phase == Phase::Bidding) {
+        if (action > static_cast<ActionId>(state.cardsInDeal)) {
+            return StepError::InvalidActionId;
+        }
+        if (p == state.dealer) {
+            int currentSum = 0;
+            for (int q = 0; q < kNumPlayers; ++q) {
+                if (q != p && state.bids[q] >= 0) {
+                    currentSum += state.bids[q];
+                }
+            }
+            if (currentSum + static_cast<int>(action) == state.cardsInDeal) {
+                return StepError::ForbiddenDealerBid;
+            }
+        }
+        return StepError::Ok;
+    }
+
+    if (state.phase == Phase::TrickPlay) {
+        if (action >= kMaxActions) {
+            return StepError::InvalidActionId;
+        }
+        const bool isLead = (state.cardsInCurrentTrick == 0);
+        const HandMask fullDeck = GetFullDeckMask(state.rules);
+        const HandMask upcardMask = (state.upcard != kInvalidCard && state.upcard < kMaxDeckSize)
+            ? (1ULL << state.upcard)
+            : 0ULL;
+
+        HandMask knownOtherHands = 0ULL;
+        for (PlayerId q = 0; q < kNumPlayers; ++q) {
+            if (q != p && state.IsHandKnown(q)) {
+                knownOtherHands |= state.hands[q];
+            }
+        }
+
+        // Действие Джокером
+        if (action >= 36U) {
+            if (isLead) {
+                if (action < kActionJokerLeadHighBase) {
+                    return StepError::InvalidActionId;
+                }
+            } else {
+                if (action != kActionJokerPlayWin && action != kActionJokerPlayLow) {
+                    return StepError::InvalidActionId;
+                }
+            }
+
+            if (state.IsHandKnown(p)) {
+                return ((state.hands[p] & kJokerMask) != 0ULL)
+                    ? StepError::Ok
+                    : StepError::NoJokerAvailable;
+            }
+            const HandMask availableJokers =
+                kJokerMask & ~(state.playedCardsHistory | knownOtherHands | upcardMask | state.impossibleCards[p]);
+            return (availableJokers != 0ULL) ? StepError::Ok : StepError::NoJokerAvailable;
+        }
+
+        // Действие обычной картой (0..35)
+        const HandMask cardBit = 1ULL << action;
+        if ((fullDeck & cardBit) == 0ULL) {
+            return StepError::InvalidActionId;
+        }
+        if ((state.playedCardsHistory & cardBit) != 0ULL) {
+            return StepError::CardAlreadyPlayed;
+        }
+        if ((upcardMask & cardBit) != 0ULL) {
+            return StepError::CardIsUpcard;
+        }
+        if ((knownOtherHands & cardBit) != 0ULL) {
+            return StepError::CardInOtherKnownHand;
+        }
+
+        if (state.IsHandKnown(p)) {
+            if ((state.hands[p] & cardBit) == 0ULL) {
+                return StepError::CardNotInHand;
+            }
+            if (!isLead) {
+                const auto& [leadCardId, leadJokerAction, leadReqSuit] = state.currentTrick[0].play;
+                const Card& leadCard = GetCard(leadCardId);
+                const Suit requiredSuit = leadCard.IsJoker() ? leadReqSuit : leadCard.suit;
+                const bool forceHighest =
+                    leadCard.IsJoker() && (leadJokerAction == JokerAction::LeadHighSuit);
+
+                const HandMask nonJokers = state.hands[p] & ~kJokerMask;
+                if (const HandMask suitCards = nonJokers & GetSuitMask(requiredSuit); suitCards != 0ULL) {
+                    if ((suitCards & cardBit) == 0ULL) {
+                        return StepError::MustFollowSuit;
+                    }
+                    if (forceHighest && action != HighestCardInMask(suitCards)) {
+                        return StepError::MustPlayHighest;
+                    }
+                } else if (state.trumpSuit != Suit::None) {
+                    if (const HandMask trumpCards = nonJokers & GetSuitMask(state.trumpSuit); trumpCards != 0ULL) {
+                        if ((trumpCards & cardBit) == 0ULL) {
+                            return StepError::MustPlayTrump;
+                        }
+                        if (forceHighest && action != HighestCardInMask(trumpCards)) {
+                            return StepError::MustPlayHighest;
+                        }
+                    }
+                }
+            }
+            return StepError::Ok;
+        }
+
+        // Неизвестная рука (Observed Mode)
+        if ((state.impossibleCards[p] & cardBit) != 0ULL) {
+            return StepError::ViolatesKnownVoidOrBound;
+        }
+        return StepError::Ok;
+    }
+
+    return StepError::InvalidActionId;
 }
 
 } // namespace joker::core::rules

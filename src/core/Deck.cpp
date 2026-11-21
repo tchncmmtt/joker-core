@@ -1,4 +1,5 @@
 #include "core/Deck.hpp"
+#include <algorithm>
 #include <bit>
 #include <random>
 
@@ -10,6 +11,22 @@ namespace joker::core {
 
 Deck::Deck(const uint64_t seed, const size_t deckSize) noexcept {
     Configure(seed, deckSize);
+}
+
+void Deck::InitOrderedDeck() noexcept {
+    size_t idx = 0;
+    if (deckSize_ == kStandardDeckSize) {
+        // 36 карт: без 6♠ (0) и 6♣ (9)
+        for (CardId i = 1; i <= 8; ++i) cards_[idx++] = i;
+        for (CardId i = 10; i <= 17; ++i) cards_[idx++] = i;
+        for (CardId i = 18; i <= 37; ++i) cards_[idx++] = i;
+        for (; idx < kMaxDeckSize; ++idx) cards_[idx] = kInvalidCard;
+    } else {
+        // 38 карт: все от 0 до 37
+        for (CardId i = 0; i < kMaxDeckSize; ++i) {
+            cards_[idx++] = i;
+        }
+    }
 }
 
 void Deck::Configure(const uint64_t seed, const size_t deckSize) noexcept {
@@ -24,20 +41,11 @@ void Deck::Configure256(std::span<const uint64_t, 4> seed, size_t deckSize) noex
 
 void Deck::SetDeckSize(const size_t deckSize) noexcept {
     deckSize_ = static_cast<uint8_t>(deckSize == kMaxDeckSize ? kMaxDeckSize : kStandardDeckSize);
-    forceOrderPending_ = false;
-    size_t idx = 0;
-    if (deckSize_ == kStandardDeckSize) {
-        // 36 карт: без 6♠ (0) и 6♣ (9)
-        for (CardId i = 1; i <= 8; ++i) cards_[idx++] = i;
-        for (CardId i = 10; i <= 17; ++i) cards_[idx++] = i;
-        for (CardId i = 18; i <= 37; ++i) cards_[idx++] = i;
-        for (; idx < kMaxDeckSize; ++idx) cards_[idx] = kInvalidCard;
-    } else {
-        // 38 карт: все от 0 до 37
-        for (CardId i = 0; i < kMaxDeckSize; ++i) {
-            cards_[idx++] = i;
-        }
+    if (forceOrderPending_) {
+        // Сохраняем принудительно заданный порядок колоды до ближайшей раздачи
+        return;
     }
+    InitOrderedDeck();
 }
 
 void Deck::Reseed(const uint64_t seed) noexcept {
@@ -84,10 +92,12 @@ void Deck::SetRemainingNinesStock(HandMask remaining24Mask) noexcept {
         remaining24Mask &= (remaining24Mask - 1ULL);
         cards_[idx++] = c;
     }
-    // Перемешиваем 24 нерозданные карты без смещения
-    for (uint32_t i = 23; i > 0; --i) {
-        uint32_t j = NextBounded(i + 1);
-        std::swap(cards_[12 + i], cards_[12 + j]);
+    const uint32_t filled = static_cast<uint32_t>(idx - 12U);
+    if (filled > 1U) {
+        for (uint32_t i = filled - 1U; i > 0U; --i) {
+            const uint32_t j = NextBounded(i + 1U);
+            std::swap(cards_[12 + i], cards_[12 + j]);
+        }
     }
 }
 
@@ -111,14 +121,15 @@ uint32_t Deck::NextBounded(const uint32_t range) noexcept {
     if (range <= 1U) return 0U;
     const auto r = static_cast<uint64_t>(range);
 #if defined(__SIZEOF_INT128__)
+    __extension__ using u128 = unsigned __int128;
     uint64_t x = NextRandom();
-    __uint128_t m = static_cast<__uint128_t>(x) * static_cast<__uint128_t>(r);
+    u128 m = static_cast<u128>(x) * static_cast<u128>(r);
     auto l = static_cast<uint64_t>(m);
     if (l < r) {
         const uint64_t threshold = (0ULL - r) % r;
         while (l < threshold) {
             x = NextRandom();
-            m = static_cast<__uint128_t>(x) * static_cast<__uint128_t>(r);
+            m = static_cast<u128>(x) * static_cast<u128>(r);
             l = static_cast<uint64_t>(m);
         }
     }
@@ -138,7 +149,7 @@ uint32_t Deck::NextBounded(const uint32_t range) noexcept {
 #else
     const uint64_t threshold = (0ULL - r) % r;
     for (;;) {
-        uint64_t x = NextRandom();
+        const uint64_t x = NextRandom();
         if (x >= threshold) {
             return static_cast<uint32_t>(x % r);
         }

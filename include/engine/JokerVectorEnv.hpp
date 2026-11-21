@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/JokerEngine.hpp"
+#include "joker_c_api.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +20,7 @@ struct RewardConfig {
 
 struct DealHistoryBuffer {
     static constexpr size_t kMaxSeqLen = 48;
-    static constexpr size_t kTokenDim  = 8;
+    static constexpr size_t kTokenDim = 8;
 
     struct RawEvent {
         uint8_t eventType{0};
@@ -45,6 +46,10 @@ struct DealHistoryBuffer {
         }
     }
 
+    [[nodiscard]] static RawEvent MakeEvent(
+        const core::GameState& stBefore,
+        core::ActionId action) noexcept;
+
     void WriteTokens(core::PlayerId observer, int16_t* outTokens, uint8_t* outLength) const noexcept;
 };
 
@@ -53,6 +58,13 @@ struct alignas(64) EnvSlot {
     uint64_t episodeCounter{0};
     uint64_t rngState{0};
     DealHistoryBuffer history{};
+};
+
+struct alignas(64) SlotStats {
+    std::array<JokerPlayerStats, core::kNumPlayers> players{};
+    std::array<uint8_t, core::kNumPlayers> matchBonusesCount{};
+
+    void Reset() noexcept;
 };
 
 class JokerVectorEnv {
@@ -78,6 +90,13 @@ public:
     [[nodiscard]] const RewardConfig& GetRewardConfig() const noexcept { return rewardConfig_; }
 
     void SetRewardConfig(const RewardConfig& cfg) noexcept { rewardConfig_ = cfg; }
+    void SetAutoReset(bool enabled) noexcept { autoReset_ = enabled; }
+    [[nodiscard]] bool GetAutoReset() const noexcept { return autoReset_; }
+
+    void SetStatsEnabled(bool enabled) noexcept { collectStats_ = enabled; }
+    [[nodiscard]] bool GetStatsEnabled() const noexcept { return collectStats_; }
+    void ResetStats() noexcept;
+    void GetAggregatedStats(std::span<JokerPlayerStats, core::kNumPlayers> outStats) const noexcept;
 
     void Reset(
         core::RulePreset preset,
@@ -86,13 +105,21 @@ public:
         core::TeamMode teamMode = core::TeamMode::Solo,
         core::PulkaMode pulkaMode = core::PulkaMode::Strict) noexcept;
 
+    void ResetWithSeeds(
+        core::RulePreset preset,
+        core::MatchMode mode,
+        core::TeamMode teamMode,
+        core::PulkaMode pulkaMode,
+        std::span<const uint64_t> seedsPerEnv) noexcept;
+
     void ForkAndDeterminize(
         const JokerEngine& rootEngine,
         core::PlayerId observer,
         uint64_t baseSeed,
         std::span<float> outObsBatch = {},
         std::span<uint64_t> outLegalMasks = {},
-        std::span<float> outOracleBatch = {}) noexcept;
+        std::span<float> outOracleBatch = {},
+        const DealHistoryBuffer* rootHistory = nullptr) noexcept;
 
     void GetObservations(
         std::span<float> outObsBatch,
@@ -144,6 +171,21 @@ public:
 private:
     void GenerateEnvSeed256(size_t envIdx, uint64_t episodeIdx, uint64_t outSeed[4]) const noexcept;
 
+    void RecordStepStats(
+        size_t envIdx,
+        core::Phase prevPhase,
+        core::PlayerId actor,
+        core::ActionId action,
+        int prevDeal,
+        int prevCardsInDeal,
+        const std::array<int8_t, core::kNumPlayers>& prevBids,
+        const std::array<int8_t, core::kNumPlayers>& finalDealTricks,
+        const std::array<int32_t, core::kNumPlayers>& prevScores,
+        const std::array<int32_t, core::kNumPlayers>& afterScores,
+        const std::array<bool, core::kNumPlayers>& prevPulkaClean,
+        bool dealDone,
+        bool matchDone) noexcept;
+
     void ComputeStepRewards(
         const std::array<int32_t, core::kNumPlayers>& prevScores,
         const std::array<int32_t, core::kNumPlayers>& afterScores,
@@ -161,6 +203,7 @@ private:
         float* outOracle) noexcept;
 
     std::vector<EnvSlot> slots_;
+    std::vector<SlotStats> slotStats_;
     core::RulePreset preset_{core::RulePreset::Popular};
     core::MatchMode mode_{core::MatchMode::Long};
     core::TeamMode teamMode_{core::TeamMode::Solo};
@@ -168,6 +211,8 @@ private:
     RewardConfig rewardConfig_{};
     uint64_t baseSeed_{42};
     int numThreads_{1};
+    bool autoReset_{true};
+    bool collectStats_{false};
 };
 
 } // namespace joker::engine

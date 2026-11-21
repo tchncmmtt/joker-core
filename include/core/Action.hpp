@@ -6,8 +6,8 @@
 namespace joker::core {
 
 enum class Phase : uint8_t {
-    ChoosingTrump = 0, // ActionId: 0..4 (Suit::Spades ... Suit::None)
-    Bidding       = 1, // ActionId: 0..9 (Заказ 0..9 взяток)
+    ChoosingTrump = 0, // ActionId: 0..4  (Suit::Spades .. Suit::None)
+    Bidding       = 1, // ActionId: 0..9  (Заказ 0..9 взяток)
     TrickPlay     = 2, // ActionId: 0..45 (0..35 карты, 36..45 Джокер)
     MatchFinished = 3
 };
@@ -17,6 +17,11 @@ using ActionMask = uint64_t;
 
 constexpr ActionId kInvalidAction = 255;
 
+// Каноническая нумерация действий Джокера:
+//   36      : PlayWin  (ответ: побить)
+//   37      : PlayLow  (ответ: сбросить по дну)
+//   38..41  : LeadHighSuit (первый ход по высшей масти: 38=♠, 39=♣, 40=♦, 41=♥)
+//   42..45  : LeadLow      (первый ход по меньшей масти: 42=♠, 43=♣, 44=♦, 45=♥)
 constexpr ActionId kActionJokerPlayWin      = 36;
 constexpr ActionId kActionJokerPlayLow      = 37;
 constexpr ActionId kActionJokerLeadHighBase = 38; // 38..41 (+ Suit 0..3)
@@ -46,12 +51,12 @@ constexpr ActionId EncodeCardPlayAction(const CardPlay& play) noexcept {
     }
 }
 
-constexpr CardPlay DecodeCardPlayAction(const ActionId action, const HandMask playerHand) noexcept {
+constexpr CardPlay DecodeCardPlayAction(const ActionId action, const HandMask availableCardsMask) noexcept {
     if (action < 36) {
         return CardPlay{.cardId = action, .jokerAction = JokerAction::None, .requestedSuit = Suit::None};
     }
 
-    const CardId jokerId = ((playerHand & (1ULL << 36)) != 0) ? 36 : 37;
+    const CardId jokerId = ((availableCardsMask & (1ULL << 36)) != 0ULL) ? 36 : 37;
 
     if (action == kActionJokerPlayWin) {
         return CardPlay{.cardId = jokerId, .jokerAction = JokerAction::PlayWin, .requestedSuit = Suit::None};
@@ -60,12 +65,18 @@ constexpr CardPlay DecodeCardPlayAction(const ActionId action, const HandMask pl
         return CardPlay{.cardId = jokerId, .jokerAction = JokerAction::PlayLow, .requestedSuit = Suit::None};
     }
     if (action >= kActionJokerLeadHighBase && action < kActionJokerLeadHighBase + 4) {
-        return CardPlay{.cardId = jokerId, .jokerAction = JokerAction::LeadHighSuit,
-            .requestedSuit = static_cast<Suit>(action - kActionJokerLeadHighBase)};
+        return CardPlay{
+            .cardId = jokerId,
+            .jokerAction = JokerAction::LeadHighSuit,
+            .requestedSuit = static_cast<Suit>(action - kActionJokerLeadHighBase)
+        };
     }
     if (action >= kActionJokerLeadLowBase && action < kActionJokerLeadLowBase + 4) {
-        return CardPlay{.cardId = jokerId, .jokerAction = JokerAction::LeadLow,
-            .requestedSuit = static_cast<Suit>(action - kActionJokerLeadLowBase)};
+        return CardPlay{
+            .cardId = jokerId,
+            .jokerAction = JokerAction::LeadLow,
+            .requestedSuit = static_cast<Suit>(action - kActionJokerLeadLowBase)
+        };
     }
     return CardPlay{};
 }

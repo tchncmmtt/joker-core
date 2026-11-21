@@ -1,6 +1,7 @@
 #include "core/GameState.hpp"
 #include "core/Rules.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <utility>
 
@@ -17,175 +18,419 @@ constexpr PlayerId AbsSeat(const int relSeat, const PlayerId observer) noexcept 
 }
 
 constexpr float CalcRawBonusValue(const GameStateView& v, const PlayerId absSeat) noexcept {
-    if (!v.pulkaClean[absSeat]) {
-        return 0.0f;
-    }
     return v.pulkaAllPasses[absSeat]
         ? 450.0f
         : static_cast<float>(v.pulkaMaxScoreExclLast[absSeat]);
 }
 
 constexpr float CalcRawPenaltyValue(const GameStateView& v, const PlayerId absSeat) noexcept {
-    if (v.pulkaClean[absSeat]) {
-        return 0.0f;
-    }
     return static_cast<float>(v.pulkaMaxNonPassScoreExclLast[absSeat]);
 }
 
-    // Эффективный ожидаемый штраф с учётом PulkaMode (Strict vs Soft)
-constexpr float CalcEffectivePenaltyRisk(const GameStateView& v, const PlayerId absSeat) noexcept {
-    if (v.pulkaClean[absSeat]) {
-        return 0.0f;
-    }
+// Точное начисление/списание по итогам пульки для произвольного вектора clean[4]
+constexpr std::array<float, kNumPlayers> ComputePulkaDeltas(
+    const GameStateView& v,
+    const std::array<bool, kNumPlayers>& clean) noexcept {
+    std::array<float, kNumPlayers> deltas{0.0f, 0.0f, 0.0f, 0.0f};
+
     if (v.pulkaMode == PulkaMode::Soft) {
-        // В мягком режиме штраф списывается только если вышел игрок "над" нами (prev = (absSeat + 3) % 4)
-        const PlayerId over = static_cast<PlayerId>((absSeat + kNumPlayers - 1) % kNumPlayers);
-        return v.pulkaClean[over] ? CalcRawPenaltyValue(v, absSeat) : 0.0f;
-    }
-    return CalcRawPenaltyValue(v, absSeat);
-}
-
-constexpr PlayerId DeterminePartialTrickWinner(
-    const std::array<TrickCard, kNumPlayers>& trick,
-    const uint8_t count,
-    const Suit trumpSuit) noexcept {
-    [[assume(count > 0 && count < kNumPlayers)]];
-
-    for (int i = static_cast<int>(count) - 1; i >= 0; --i) {
-        const auto& play = trick[i].play;
-        if (GetCard(play.cardId).IsJoker() && play.jokerAction == JokerAction::PlayWin) {
-            return trick[i].player;
-        }
-    }
-
-    const auto& [cardId, jokerAction, requestedSuit] = trick[0].play;
-    const Card& leadCard = GetCard(cardId);
-
-    if (leadCard.IsJoker() && jokerAction == JokerAction::LeadHighSuit) {
-        PlayerId winner = trick[0].player;
-        auto bestTrumpRank = Rank::Six;
-
-        if (trumpSuit != Suit::None && requestedSuit != trumpSuit) {
-            bool trumped = false;
-            for (uint8_t i = 1; i < count; ++i) {
-                if (const Card& c = GetCard(trick[i].play.cardId); !c.IsJoker() && c.suit == trumpSuit) {
-                    if (!trumped || c.rank > bestTrumpRank) {
-                        trumped = true;
-                        bestTrumpRank = c.rank;
-                        winner = trick[i].player;
-                    }
+        for (int p = 0; p < kNumPlayers; ++p) {
+            const int over = (p + kNumPlayers - 1) % kNumPlayers;
+            if (clean[p]) {
+                if (!clean[over]) {
+                    deltas[p] = CalcRawBonusValue(v, static_cast<PlayerId>(p));
                 }
+            } else if (clean[over]) {
+                deltas[p] = -CalcRawPenaltyValue(v, static_cast<PlayerId>(p));
             }
         }
-        return winner;
+        return deltas;
     }
 
-    const Suit effectiveLeadSuit = leadCard.IsJoker() ? requestedSuit : leadCard.suit;
-    PlayerId winner = trick[0].player;
-    Suit winningSuit = leadCard.IsJoker() ? Suit::None : leadCard.suit;
-    Rank winningRank = leadCard.rank;
-    bool hasValidCardWinner = !leadCard.IsJoker();
-
-    for (uint8_t i = 1; i < count; ++i) {
-        const Card& c = GetCard(trick[i].play.cardId);
-        if (c.IsJoker()) continue;
-
-        if (!hasValidCardWinner) {
-            if (c.suit == effectiveLeadSuit || (trumpSuit != Suit::None && c.suit == trumpSuit)) {
-                hasValidCardWinner = true;
-                winner = trick[i].player;
-                winningSuit = c.suit;
-                winningRank = c.rank;
-            }
-            continue;
+    if (v.teamMode == TeamMode::Pairs) {
+        const bool teamAClean = clean[0] || clean[2];
+        const bool teamBClean = clean[1] || clean[3];
+        if (!teamAClean && !teamBClean) {
+            return deltas;
         }
-
-        if (c.suit == winningSuit) {
-            if (c.rank > winningRank) {
-                winningRank = c.rank;
-                winner = trick[i].player;
+        const bool bothClean = teamAClean && teamBClean;
+        for (int p = 0; p < kNumPlayers; ++p) {
+            const bool ownClean = (p == 0 || p == 2) ? teamAClean : teamBClean;
+            if (clean[p]) {
+                if (!bothClean) {
+                    deltas[p] = CalcRawBonusValue(v, static_cast<PlayerId>(p));
+                }
+            } else if (!ownClean) {
+                deltas[p] = -CalcRawPenaltyValue(v, static_cast<PlayerId>(p));
             }
-        } else if (trumpSuit != Suit::None && c.suit == trumpSuit && winningSuit != trumpSuit) {
-            winningSuit = trumpSuit;
-            winningRank = c.rank;
-            winner = trick[i].player;
         }
+        return deltas;
     }
 
-    return winner;
+    // Solo + Strict
+    int numClean = 0;
+    for (int p = 0; p < kNumPlayers; ++p) {
+        if (clean[p]) ++numClean;
+    }
+    if (numClean == 0) {
+        return deltas;
+    }
+    for (int p = 0; p < kNumPlayers; ++p) {
+        if (clean[p]) {
+            if (numClean == 1) {
+                deltas[p] = CalcRawBonusValue(v, static_cast<PlayerId>(p));
+            }
+        } else {
+            deltas[p] = -CalcRawPenaltyValue(v, static_cast<PlayerId>(p));
+        }
+    }
+    return deltas;
 }
 
-inline void WriteCardMask(float* dst, const HandMask mask) noexcept {
-    for (size_t id = 0; id < kMaxDeckSize; ++id) {
-        dst[id] = ((mask & (1ULL << id)) != 0) ? 1.0f : 0.0f;
+constexpr float RelativeBalanceFromDeltas(
+    const std::array<float, kNumPlayers>& deltas,
+    const PlayerId me,
+    const TeamMode teamMode) noexcept {
+    if (teamMode == TeamMode::Pairs) {
+        const PlayerId partner = AbsSeat(2, me);
+        const PlayerId enemy1  = AbsSeat(1, me);
+        const PlayerId enemy2  = AbsSeat(3, me);
+        return (deltas[me] + deltas[partner]) - (deltas[enemy1] + deltas[enemy2]);
     }
+    const float sumAll = deltas[0] + deltas[1] + deltas[2] + deltas[3];
+    const float oppMean = (sumAll - deltas[me]) / 3.0f;
+    return deltas[me] - oppMean;
 }
 
-// Общий блок 0..15: Фаза, универсальный горизонт пулек и позиция дилера
-// (Флаги RulePreset и MatchMode исключены, так как под каждый режим обучается отдельная сеть)
-inline void WriteHeaderBlock(const GameStateView& v, float* out) noexcept {
-    if (v.phase != Phase::MatchFinished) {
-        out[std::to_underlying(v.phase)] = 1.0f; // 0..2: Phase one-hot
+struct HorizonInfo {
+    int remainingTricksInDeal{0};
+    int remainingDealsInPulka{0};
+    int remainingCardsInPulka{0};
+    int nextDealCards{0};
+    int maxFutureNonLastDealCards{0};
+    int remainingPulkasAfterCurrent{0};
+    int remainingMatchCards{0};
+    bool isPulkaEnd{false};
+    bool isNinesPulka{false};
+};
+
+constexpr HorizonInfo ComputeHorizon(const GameStateView& v) noexcept {
+    HorizonInfo h{};
+    if (v.phase == Phase::MatchFinished) {
+        return h;
     }
 
     const int totalDeals = GetTotalDeals(v.mode);
     const int totalPulkas = GetPulkasCount(v.mode);
-    const auto& sched = GetScheduleEntry(v.mode, std::clamp(v.dealNumber, 0, totalDeals - 1));
-    const int pulkaLen = (v.mode == MatchMode::Short || sched.isNineCardDeal) ? 4 : 8;
-    const int remainingPulkas = std::max(0, totalPulkas - 1 - v.pulkaIndex);
-    const int remainingDealsInPulka = std::max(0, pulkaLen - 1 - v.roundInPulka);
+    const int dealIdx = std::clamp(v.dealNumber, 0, totalDeals - 1);
+    const auto& cur = GetScheduleEntry(v.mode, dealIdx);
 
-    out[3] = static_cast<float>(remainingPulkas) / 4.0f;       // 0.0 на финальной пульке матча (и в Long, и в Short)
-    out[4] = static_cast<float>(v.roundInPulka) / static_cast<float>(pulkaLen);
-    out[5] = static_cast<float>(remainingDealsInPulka) / 8.0f; // сколько сдач осталось в текущей пульке
-    out[6] = static_cast<float>(v.cardsInDeal) / 9.0f;
-    out[7] = sched.isPulkaEnd ? 1.0f : 0.0f;
+    const int completedTricks =
+        v.tricksTaken[0] + v.tricksTaken[1] + v.tricksTaken[2] + v.tricksTaken[3];
+    h.remainingTricksInDeal = std::max(0, v.cardsInDeal - completedTricks);
+    h.isPulkaEnd = cur.isPulkaEnd;
+    h.isNinesPulka = cur.isNineCardDeal;
+    h.remainingPulkasAfterCurrent = std::max(0, totalPulkas - 1 - cur.pulkaIndex);
 
-    const int relDealer = RelSeat(v.dealerPlayer, v.observerPlayer);
-    out[8 + relDealer] = 1.0f; // 8..11: относительный дилер one-hot
-    // 12..15: резерв (0.0)
-}
+    h.remainingCardsInPulka = h.remainingTricksInDeal;
+    h.remainingMatchCards = h.remainingTricksInDeal;
 
-// Общий блок 120..383: Карточные матрицы (6 * 38) и память стола (ренонсы + счётчики)
-inline void WriteCardsAndMemoryBlock(const GameStateView& v, float* out) noexcept {
-    WriteCardMask(out + 120, v.myHand);
-    WriteCardMask(out + 158, v.playedCardsHistory);
-
-    const HandMask upcardMask = (v.upcard != kInvalidCard && v.upcard < kMaxDeckSize)
-        ? (1ULL << v.upcard) : 0ULL;
-    WriteCardMask(out + 196, upcardMask);
-
-    for (uint8_t i = 0; i < 3; ++i) {
-        const HandMask trickCardMask = (i < v.cardsInCurrentTrick)
-            ? (1ULL << v.currentTrick[i].play.cardId) : 0ULL;
-        WriteCardMask(out + 234 + i * kMaxDeckSize, trickCardMask);
+    if (!cur.isPulkaEnd && (dealIdx + 1) < totalDeals) {
+        h.nextDealCards = GetScheduleEntry(v.mode, dealIdx + 1).cardsPerPlayer;
     }
 
-    for (int rel = 1; rel < kNumPlayers; ++rel) {
-        const PlayerId absP = AbsSeat(rel, v.observerPlayer);
-        const uint8_t voids = v.voidSuits[absP];
-        const int base = 348 + (rel - 1) * 4;
-        for (int s = 0; s < 4; ++s) {
-            out[base + s] = ((voids & (1U << s)) != 0) ? 1.0f : 0.0f;
+    for (int d = dealIdx + 1; d < totalDeals; ++d) {
+        const auto& e = GetScheduleEntry(v.mode, d);
+        h.remainingMatchCards += e.cardsPerPlayer;
+        if (e.pulkaIndex == cur.pulkaIndex) {
+            h.remainingDealsInPulka++;
+            h.remainingCardsInPulka += e.cardsPerPlayer;
+            if (!e.isPulkaEnd && e.cardsPerPlayer > h.maxFutureNonLastDealCards) {
+                h.maxFutureNonLastDealCards = e.cardsPerPlayer;
+            }
         }
     }
 
-    HandMask visibleMask = v.myHand | v.playedCardsHistory | upcardMask;
-    for (uint8_t i = 0; i < v.cardsInCurrentTrick; ++i) {
-        visibleMask |= (1ULL << v.currentTrick[i].play.cardId);
+    return h;
+}
+
+inline void WriteCardMask(float* dst, const HandMask mask) noexcept {
+    for (size_t id = 0; id < kMaxDeckSize; ++id) {
+        dst[id] = ((mask & (1ULL << id)) != 0ULL) ? 1.0f : 0.0f;
     }
+}
+
+// Блок A (0..17): Фаза и марковский горизонт будущего (единый для Long и Short)
+inline void WriteBlockA(const GameStateView& v, const HorizonInfo& h, float* out) noexcept {
+    if (v.phase != Phase::MatchFinished) {
+        out[std::to_underlying(v.phase)] = 1.0f; // 0..2
+    }
+    out[3] = static_cast<float>(v.cardsInDeal) / 9.0f;
+    out[4] = static_cast<float>(h.remainingTricksInDeal) / 9.0f;
+
+    const int relDealer = RelSeat(v.dealerPlayer, v.observerPlayer);
+    out[5 + relDealer] = 1.0f; // 5..8
+
+    const int firstBidder = (static_cast<int>(v.dealerPlayer) + 1) % kNumPlayers;
+    const int biddingOrder = (static_cast<int>(v.observerPlayer) - firstBidder + kNumPlayers) % kNumPlayers;
+    out[9] = static_cast<float>(biddingOrder) / 3.0f;
+
+    out[10] = static_cast<float>(h.remainingDealsInPulka) / 8.0f;
+    out[11] = static_cast<float>(h.remainingCardsInPulka) / 36.0f;
+    out[12] = h.isPulkaEnd ? 1.0f : 0.0f;
+    out[13] = h.isNinesPulka ? 1.0f : 0.0f;
+    out[14] = static_cast<float>(h.nextDealCards) / 9.0f;
+    out[15] = static_cast<float>(h.maxFutureNonLastDealCards) / 9.0f;
+    out[16] = static_cast<float>(h.remainingPulkasAfterCurrent) / 3.0f;
+    out[17] = static_cast<float>(h.remainingMatchCards) / 144.0f;
+}
+
+// Общая часть Блока B (26..41): статусы пульки, projectedPulkaDelta и контрфактические спреды
+inline void WriteBlockBPulkaCommon(
+    const GameStateView& v,
+    const std::array<float, kNumPlayers>& baseDeltas,
+    float* out) noexcept {
+    const PlayerId me = v.observerPlayer;
+    const float baseBal = RelativeBalanceFromDeltas(baseDeltas, me, v.teamMode);
+
+    for (int rel = 0; rel < kNumPlayers; ++rel) {
+        const PlayerId absP = AbsSeat(rel, me);
+        out[26 + rel] = v.pulkaClean[absP] ? 1.0f : 0.0f;
+        out[30 + rel] = v.pulkaAllPasses[absP] ? 1.0f : 0.0f;
+        out[34 + rel] = baseDeltas[absP] / 500.0f;
+
+        float netSwing = 0.0f;
+        if (v.pulkaClean[absP]) {
+            auto altClean = v.pulkaClean;
+            altClean[absP] = false;
+            const auto altDeltas = ComputePulkaDeltas(v, altClean);
+            netSwing = RelativeBalanceFromDeltas(altDeltas, me, v.teamMode) - baseBal;
+        }
+        out[38 + rel] = netSwing / 500.0f;
+    }
+}
+
+// Блок C (42..119): Контракты, баланс стола и механика текущей взятки
+inline void WriteBlockC(const GameStateView& v, const HorizonInfo& h, float* out) noexcept {
+    const PlayerId me = v.observerPlayer;
+    const int remTricks = std::max(1, h.remainingTricksInDeal);
+    int sumBids = 0;
+
+    for (int rel = 0; rel < kNumPlayers; ++rel) {
+        const PlayerId absP = AbsSeat(rel, me);
+        const int b = v.bids[absP];
+        const int t = v.tricksTaken[absP];
+        const bool hasB = (b >= 0);
+        if (hasB) sumBids += b;
+
+        const int need = hasB ? (b - t) : 0;
+        const float deficitRatio = hasB
+            ? std::clamp(static_cast<float>(need) / static_cast<float>(remTricks), 0.0f, 1.5f)
+            : 0.0f;
+        const bool broken = hasB && (t > b || need > h.remainingTricksInDeal);
+        const bool shangaRisk = hasB && (b > 0) && (t == 0);
+
+        out[42 + rel] = hasB ? (static_cast<float>(b) / 9.0f) : 0.0f;
+        out[46 + rel] = hasB ? 1.0f : 0.0f;
+        out[50 + rel] = static_cast<float>(t) / 9.0f;
+        out[54 + rel] = deficitRatio;
+        out[58 + rel] = broken ? 1.0f : 0.0f;
+        out[62 + rel] = shangaRisk ? 1.0f : 0.0f;
+    }
+
+    // 66..69: баланс стола (общий + командный для Pairs)
+    out[66] = static_cast<float>(v.cardsInDeal - sumBids) / 9.0f;
+    out[67] = static_cast<float>(sumBids) / static_cast<float>(std::max(1, v.cardsInDeal));
+    if (v.teamMode == TeamMode::Pairs) {
+        const PlayerId partner = AbsSeat(2, me);
+        const int myBid = std::max<int>(0, v.bids[me]);
+        const int pBid  = std::max<int>(0, v.bids[partner]);
+        const int myNeed = (v.bids[me] >= 0) ? std::max(0, v.bids[me] - v.tricksTaken[me]) : 0;
+        const int pNeed  = (v.bids[partner] >= 0) ? std::max(0, v.bids[partner] - v.tricksTaken[partner]) : 0;
+        out[68] = static_cast<float>(myBid + pBid) / 18.0f;
+        out[69] = static_cast<float>(myNeed + pNeed) / 18.0f;
+    }
+
+    // 70..79: запрещённый заказ дилера one-hot (0..9)
+    if (v.phase == Phase::Bidding && me == v.dealerPlayer) {
+        int sumOther = 0;
+        for (int p = 0; p < kNumPlayers; ++p) {
+            if (p != me && v.bids[p] >= 0) sumOther += v.bids[p];
+        }
+        const int forbidden = v.cardsInDeal - sumOther;
+        if (forbidden >= 0 && forbidden <= v.cardsInDeal && forbidden < 10) {
+            out[70 + forbidden] = 1.0f;
+        }
+    }
+
+    // 80..89: trumpSuit (5) и requiredSuit (5)
+    out[80 + std::to_underlying(v.trumpSuit)] = 1.0f;
+
+    Suit reqSuit = Suit::None;
+    bool forceHigh = false;
+    if (v.phase == Phase::TrickPlay && v.cardsInCurrentTrick > 0U) {
+        const auto& leadPlay = v.currentTrick[0].play;
+        const Card& leadCard = GetCard(leadPlay.cardId);
+        reqSuit = leadCard.IsJoker() ? leadPlay.requestedSuit : leadCard.suit;
+        forceHigh = leadCard.IsJoker() && (leadPlay.jokerAction == JokerAction::LeadHighSuit);
+    }
+    out[85 + std::to_underlying(reqSuit)] = 1.0f;
+
+    // 90..92: состояние взятки
+    out[90] = static_cast<float>(v.cardsInCurrentTrick) / 3.0f;
+    out[91] = forceHigh ? 1.0f : 0.0f;
+    out[92] = (v.phase == Phase::TrickPlay && v.cardsInCurrentTrick == 0U) ? 1.0f : 0.0f;
+
+    // 93..116: сила текущей взятки, лидер и действия Джокера по слотам 0..2
+    if (v.phase == Phase::TrickPlay && v.cardsInCurrentTrick > 0U) {
+        const PlayerId curWinner = rules::DetermineTrickWinnerN(v.currentTrick, v.cardsInCurrentTrick, v.trumpSuit);
+        out[93 + RelSeat(curWinner, me)] = 1.0f;
+        if (v.teamMode == TeamMode::Pairs) {
+            out[97] = (curWinner == AbsSeat(2, me)) ? 1.0f : 0.0f;
+        }
+
+        // Определяем карту победителя взятки
+        for (uint8_t i = 0; i < v.cardsInCurrentTrick; ++i) {
+            if (v.currentTrick[i].player == curWinner) {
+                const auto& wp = v.currentTrick[i].play;
+                const Card& wc = GetCard(wp.cardId);
+                if (wc.IsJoker()) {
+                    out[98] = 1.0f; // trickHeldByJokerWin (PlayWin или неперебитый LeadHighSuit)
+                    out[100] = 1.0f;
+                } else {
+                    out[99] = (v.trumpSuit != Suit::None && wc.suit == v.trumpSuit) ? 1.0f : 0.0f;
+                    out[100] = static_cast<float>(std::to_underlying(wc.rank)) / 8.0f;
+                }
+                break;
+            }
+        }
+
+        // Относительная позиция игрока, открывшего взятку
+        out[101 + RelSeat(v.currentTrick[0].player, me)] = 1.0f;
+
+        // Типы действий Джокера в 3 слотах текущей взятки (3 * 4 = 12)
+        for (uint8_t i = 0; i < v.cardsInCurrentTrick && i < 3U; ++i) {
+            const JokerAction ja = v.currentTrick[i].play.jokerAction;
+            if (ja != JokerAction::None) {
+                out[105 + static_cast<int>(i) * 4 + (std::to_underlying(ja) - 1)] = 1.0f;
+            }
+        }
+    }
+    // 117..119: резерв (0.0)
+}
+
+// Блок D (120..319): Карты, логическая память (impossibleCards), Master Cards и тактика
+inline void WriteBlockD(const GameStateView& v, float* out) noexcept {
+    const PlayerId me = v.observerPlayer;
+    const HandMask upcardMask = (v.upcard != kInvalidCard && v.upcard < kMaxDeckSize)
+        ? (1ULL << v.upcard) : 0ULL;
+
+    HandMask currentTrickMask = 0ULL;
+    for (uint8_t i = 0; i < v.cardsInCurrentTrick && i < 3U; ++i) {
+        const CardId cid = v.currentTrick[i].play.cardId;
+        if (cid < kMaxDeckSize) {
+            currentTrickMask |= (1ULL << cid);
+        }
+    }
+
+    // 120..271: 4 компактные 38-битные маски (myHand, playedHistory, upcard, currentTrick)
+    WriteCardMask(out + 120, v.myHand);
+    WriteCardMask(out + 158, v.playedCardsHistory);
+    WriteCardMask(out + 196, upcardMask);
+    WriteCardMask(out + 234, currentTrickMask);
+
+    const HandMask visibleMask = v.myHand | v.playedCardsHistory | upcardMask | currentTrickMask;
     const HandMask fullDeck = rules::GetFullDeckMask(v.rules);
     const HandMask unseenMask = fullDeck & ~visibleMask;
 
+    // 272..295: явные ренонсы (3*4) + потолок максимального возможного ранга оппонентов (3*4)
+    for (int rel = 1; rel < kNumPlayers; ++rel) {
+        const PlayerId absP = AbsSeat(rel, me);
+        const uint8_t voids = v.voidSuits[absP];
+        const HandMask oppPossible = unseenMask & ~v.impossibleCards[absP];
+        const int voidBase = 272 + (rel - 1) * 4;
+        const int ceilBase = 284 + (rel - 1) * 4;
+
+        for (int s = 0; s < 4; ++s) {
+            out[voidBase + s] = ((voids & (1U << s)) != 0U) ? 1.0f : 0.0f;
+            const HandMask suitPossible = oppPossible & GetSuitMask(static_cast<Suit>(s));
+            if (suitPossible != 0ULL) {
+                const CardId maxCid = HighestCardInMask(suitPossible);
+                out[ceilBase + s] = static_cast<float>(std::to_underlying(GetCard(maxCid).rank) + 1) / 9.0f;
+            }
+        }
+    }
+
+    // 296..301: Джокеры
+    for (int rel = 0; rel < kNumPlayers; ++rel) {
+        out[296 + rel] = static_cast<float>(v.jokersPlayedBy[AbsSeat(rel, me)]) / 2.0f;
+    }
+    out[300] = static_cast<float>(std::popcount(unseenMask & kJokerMask)) / 2.0f;
+    out[301] = static_cast<float>(std::popcount(v.myHand & kJokerMask)) / 2.0f;
+
+    // 302..317: счёт карт, Master Cards и старшая невышедшая чужая карта по 4 мастям
     const float suitCap = (v.rules == RulePreset::Classic) ? 9.0f : 8.0f;
     for (int s = 0; s < 4; ++s) {
+        const Suit suit = static_cast<Suit>(s);
         const float maxSuitCards = (s >= 2) ? 9.0f : suitCap;
-        const HandMask sMask = GetSuitMask(static_cast<Suit>(s));
-        out[360 + s] = static_cast<float>(std::popcount(unseenMask & sMask)) / maxSuitCards;
-        out[365 + s] = static_cast<float>(std::popcount(v.myHand & sMask)) / maxSuitCards;
+        const HandMask sMask = GetSuitMask(suit);
+        const HandMask unseenSuit = unseenMask & sMask;
+        const HandMask mySuit = v.myHand & sMask;
+
+        out[302 + s] = static_cast<float>(std::popcount(unseenSuit)) / maxSuitCards;
+        out[306 + s] = static_cast<float>(std::popcount(mySuit)) / maxSuitCards;
+
+        int masterCount = 0;
+        HandMask m = mySuit;
+        while (m != 0ULL) {
+            const CardId cid = LowestCardInMask(m);
+            m &= (m - 1ULL);
+            if ((GetHigherCardsInSuitMask(suit, GetCard(cid).rank) & unseenSuit) == 0ULL) {
+                ++masterCount;
+            }
+        }
+        out[310 + s] = std::min(1.0f, static_cast<float>(masterCount) / 4.0f);
+
+        if (unseenSuit != 0ULL) {
+            const CardId topOpp = HighestCardInMask(unseenSuit);
+            out[314 + s] = static_cast<float>(std::to_underlying(GetCard(topOpp).rank) + 1) / 9.0f;
+        }
     }
-    out[364] = static_cast<float>(std::popcount(unseenMask & kJokerMask)) / 2.0f;
-    out[369] = static_cast<float>(std::popcount(v.myHand & kJokerMask)) / 2.0f;
+
+    // 318..319: тактические агрегаты относительно текущей взятки
+    if (v.phase == Phase::TrickPlay && v.cardsInCurrentTrick > 0U && v.myHand != 0ULL) {
+        const int handSize = std::popcount(v.myHand);
+        const ActionMask legal = rules::GetLegalActionsMask(v);
+        int winCards = 0;
+        int loseCards = 0;
+
+        std::array<TrickCard, kNumPlayers> simTrick = v.currentTrick;
+        const uint8_t nextCnt = static_cast<uint8_t>(v.cardsInCurrentTrick + 1U);
+
+        HandMask normalLegal = legal & ~kJokerFollowActionsMask;
+        while (normalLegal != 0ULL) {
+            const CardId cid = LowestCardInMask(normalLegal);
+            normalLegal &= (normalLegal - 1ULL);
+            simTrick[v.cardsInCurrentTrick] = TrickCard{
+                me, CardPlay{.cardId = cid, .jokerAction = JokerAction::None, .requestedSuit = Suit::None}
+            };
+            if (rules::DetermineTrickWinnerN(simTrick, nextCnt, v.trumpSuit) == me) {
+                ++winCards;
+            } else {
+                ++loseCards;
+            }
+        }
+
+        const int myJokers = std::popcount(v.myHand & kJokerMask);
+        if (myJokers > 0) {
+            if (((legal >> kActionJokerPlayWin) & 1ULL) != 0ULL) winCards += myJokers;
+            if (((legal >> kActionJokerPlayLow) & 1ULL) != 0ULL) loseCards += myJokers;
+        }
+
+        const float denom = static_cast<float>(std::max(1, handSize));
+        out[318] = std::min(1.0f, static_cast<float>(winCards) / denom);
+        out[319] = std::min(1.0f, static_cast<float>(loseCards) / denom);
+    }
 }
 
 } // namespace
@@ -195,6 +440,7 @@ void GameState::ResetForNewMatch(const RulePreset preset,
                                  const TeamMode tMode,
                                  const PulkaMode pMode) noexcept {
     hands.fill(0);
+    impossibleCards.fill(0);
     playedCardsHistory = 0;
     totalScores.fill(0);
     ResetPulkaTrackers();
@@ -202,7 +448,7 @@ void GameState::ResetForNewMatch(const RulePreset preset,
     currentTrick.fill(TrickCard{});
     bids.fill(-1);
     tricksTaken.fill(0);
-    voidSuits.fill(0);
+    handCounts.fill(0);
     jokersPlayedBy.fill(0);
 
     dealNumber = 0;
@@ -222,6 +468,9 @@ void GameState::ResetForNewMatch(const RulePreset preset,
     trumpSuit = Suit::None;
     upcard = kInvalidCard;
     cardsInCurrentTrick = 0;
+    knownHandsMask = 0x0F;
+    observedFlags = 0;
+    heroSeat = 0;
 }
 
 void GameState::ResetPulkaTrackers() noexcept {
@@ -262,11 +511,13 @@ GameStateView GameState::CreateView(const PlayerId observer) const noexcept {
         view.totalScores[i] = totalScores[i];
         view.pulkaMaxScoreExclLast[i] = pulkaMaxScoreExclLast[i];
         view.pulkaMaxNonPassScoreExclLast[i] = pulkaMaxNonPassScoreExclLast[i];
+        view.impossibleCards[i] = impossibleCards[i];
+        view.voidSuits[i] = ComputeVoidSuitsMask(static_cast<PlayerId>(i));
+        view.handCounts[i] = handCounts[i];
     }
 
     view.pulkaClean = pulkaClean;
     view.pulkaAllPasses = pulkaAllPasses;
-    view.voidSuits = voidSuits;
     view.jokersPlayedBy = jokersPlayedBy;
 
     view.currentTrick = currentTrick;
@@ -278,97 +529,41 @@ GameStateView GameState::CreateView(const PlayerId observer) const noexcept {
 void GameStateView::WriteSoloTensor(float* out) const noexcept {
     std::fill_n(out, kTensorSize, 0.0f);
 
-    WriteHeaderBlock(*this, out);
+    const HorizonInfo h = ComputeHorizon(*this);
+    WriteBlockA(*this, h, out);
 
-    // 16..39: очки и экономика пульки (Solo)
+    // Блок B — Solo (18..41): строго относительные отрывы, никаких абсолютных счетов!
     const PlayerId me = observerPlayer;
     const float myScore = static_cast<float>(totalScores[me]);
-    int cleanCount = 0;
+    const float matchPot = std::max(100.0f, static_cast<float>(h.remainingMatchCards) * 25.0f);
 
-    for (int rel = 0; rel < kNumPlayers; ++rel) {
+    int strictlyBetter = 0;
+    for (int rel = 1; rel < kNumPlayers; ++rel) {
         const PlayerId absP = AbsSeat(rel, me);
-        const float pScore = static_cast<float>(totalScores[absP]);
-
-        out[16 + rel] = pScore / 1000.0f;
-        if (rel > 0) {
-            out[20 + (rel - 1)] = (pScore - myScore) / 1000.0f;
+        const float diff = static_cast<float>(totalScores[absP]) - myScore;
+        if (totalScores[absP] > totalScores[me]) {
+            ++strictlyBetter;
         }
-
-        const bool clean = pulkaClean[absP];
-        if (clean) ++cleanCount;
-        out[23 + rel] = clean ? 1.0f : 0.0f;
-        out[27 + rel] = CalcRawBonusValue(*this, absP) / 500.0f;
-        out[31 + rel] = CalcEffectivePenaltyRisk(*this, absP) / 500.0f;
+        out[18 + (rel - 1)] = diff / 500.0f;       // 18..20
+        out[21 + (rel - 1)] = diff / matchPot;     // 21..23
     }
-    out[35] = static_cast<float>(cleanCount) / 4.0f;
+    out[24] = static_cast<float>(3 - strictlyBetter) / 3.0f; // 1.0 = лидер, 0.0 = 4-е место
+    // 25: резерв (0.0)
 
-    // 40..67: контракты сдачи
-    for (int rel = 0; rel < kNumPlayers; ++rel) {
-        const PlayerId absP = AbsSeat(rel, me);
-        const int b = bids[absP];
-        const int t = tricksTaken[absP];
-        const bool hasB = (b >= 0);
+    const auto baseDeltas = ComputePulkaDeltas(*this, pulkaClean);
+    WriteBlockBPulkaCommon(*this, baseDeltas, out);
 
-        out[40 + rel] = hasB ? (static_cast<float>(b) / 9.0f) : 0.0f;
-        out[44 + rel] = hasB ? 1.0f : 0.0f;
-        out[48 + rel] = static_cast<float>(t) / 9.0f;
-        out[52 + rel] = hasB ? (static_cast<float>(std::max(0, b - t)) / 9.0f) : 0.0f;
-        out[56 + rel] = (hasB && t == b) ? 1.0f : 0.0f;
-        out[60 + rel] = (hasB && t > b) ? 1.0f : 0.0f;
-        out[64 + rel] = (hasB && b > 0 && t == 0) ? 1.0f : 0.0f;
-    }
-
-    // 68..119: механика хода
-    if (phase == Phase::Bidding && me == dealerPlayer) {
-        int sumOther = 0;
-        for (int p = 0; p < kNumPlayers; ++p) {
-            if (p != me && bids[p] >= 0) sumOther += bids[p];
-        }
-        const int forbidden = cardsInDeal - sumOther;
-        if (forbidden >= 0 && forbidden <= cardsInDeal) {
-            out[68 + forbidden] = 1.0f;
-        }
-    }
-
-    out[78 + std::to_underlying(trumpSuit)] = 1.0f;
-
-    Suit reqSuit = Suit::None;
-    bool forceHigh = false;
-    if (phase == Phase::TrickPlay && cardsInCurrentTrick > 0) {
-        const auto& leadPlay = currentTrick[0].play;
-        const Card& leadCard = GetCard(leadPlay.cardId);
-        reqSuit = leadCard.IsJoker() ? leadPlay.requestedSuit : leadCard.suit;
-        forceHigh = leadCard.IsJoker() && (leadPlay.jokerAction == JokerAction::LeadHighSuit);
-    }
-    out[83 + std::to_underlying(reqSuit)] = 1.0f;
-
-    out[88] = static_cast<float>(cardsInCurrentTrick) / 3.0f;
-    out[89] = forceHigh ? 1.0f : 0.0f;
-    out[90] = (phase == Phase::TrickPlay && cardsInCurrentTrick == 0) ? 1.0f : 0.0f;
-
-    if (phase == Phase::TrickPlay && cardsInCurrentTrick > 0) {
-        const PlayerId curWinner = DeterminePartialTrickWinner(currentTrick, cardsInCurrentTrick, trumpSuit);
-        out[91 + RelSeat(curWinner, me)] = 1.0f;
-    }
-
-    for (uint8_t i = 0; i < cardsInCurrentTrick && i < 3; ++i) {
-        const int base = 95 + i * 8;
-        out[base + RelSeat(currentTrick[i].player, me)] = 1.0f;
-        const JokerAction ja = currentTrick[i].play.jokerAction;
-        if (ja != JokerAction::None) {
-            out[base + 4 + (std::to_underlying(ja) - 1)] = 1.0f;
-        }
-    }
-
-    WriteCardsAndMemoryBlock(*this, out);
+    WriteBlockC(*this, h, out);
+    WriteBlockD(*this, out);
 }
 
 void GameStateView::WritePairsTensor(float* out) const noexcept {
     std::fill_n(out, kTensorSize, 0.0f);
 
-    WriteHeaderBlock(*this, out);
+    const HorizonInfo h = ComputeHorizon(*this);
+    WriteBlockA(*this, h, out);
 
-    // 16..39: командный счёт и пулька Pairs (0 = Я, 1 = Враг под нами, 2 = Партнёр, 3 = Враг над нами)
+    // Блок B — Pairs (18..41): строго относительные командные отрывы
     const PlayerId me = observerPlayer;
     const PlayerId enemyUnder = AbsSeat(1, me);
     const PlayerId partner = AbsSeat(2, me);
@@ -376,119 +571,27 @@ void GameStateView::WritePairsTensor(float* out) const noexcept {
 
     const float myTeamScore = static_cast<float>(totalScores[me] + totalScores[partner]);
     const float enemyTeamScore = static_cast<float>(totalScores[enemyOver] + totalScores[enemyUnder]);
+    const float diff = enemyTeamScore - myTeamScore;
+    const float matchPot = std::max(100.0f, static_cast<float>(h.remainingMatchCards) * 50.0f);
 
-    out[16] = myTeamScore / 1000.0f;
-    out[17] = enemyTeamScore / 1000.0f;
-    out[18] = (myTeamScore - enemyTeamScore) / 1000.0f;
-
-    for (int rel = 0; rel < kNumPlayers; ++rel) {
-        const PlayerId absP = AbsSeat(rel, me);
-        out[19 + rel] = pulkaClean[absP] ? 1.0f : 0.0f;
-        out[23 + rel] = CalcRawBonusValue(*this, absP) / 500.0f;
-        out[27 + rel] = CalcEffectivePenaltyRisk(*this, absP) / 500.0f;
-    }
+    out[18] = diff / 500.0f;
+    out[19] = diff / matchPot;
+    out[20] = (myTeamScore > enemyTeamScore) ? 1.0f : 0.0f;
 
     const int myTeamClean = (pulkaClean[me] ? 1 : 0) + (pulkaClean[partner] ? 1 : 0);
     const int enemyTeamClean = (pulkaClean[enemyOver] ? 1 : 0) + (pulkaClean[enemyUnder] ? 1 : 0);
+    out[21] = static_cast<float>(myTeamClean) / 2.0f;
+    out[22] = static_cast<float>(enemyTeamClean) / 2.0f;
 
-    float myTeamBonusSum = 0.0f;
-    float myTeamPenaltyRisk = 0.0f;
+    const auto baseDeltas = ComputePulkaDeltas(*this, pulkaClean);
+    out[23] = (baseDeltas[me] + baseDeltas[partner]) / 500.0f;
+    out[24] = (baseDeltas[enemyOver] + baseDeltas[enemyUnder]) / 500.0f;
+    // 25: резерв (0.0)
 
-    if (pulkaMode == PulkaMode::Soft) {
-        // В мягком режиме каждый из пары получает премию, если не вышел соперник "над ним"
-        if (pulkaClean[me] && !pulkaClean[enemyOver]) {
-            myTeamBonusSum += CalcRawBonusValue(*this, me);
-        }
-        if (pulkaClean[partner] && !pulkaClean[enemyUnder]) {
-            myTeamBonusSum += CalcRawBonusValue(*this, partner);
-        }
-        myTeamPenaltyRisk = CalcEffectivePenaltyRisk(*this, me) + CalcEffectivePenaltyRisk(*this, partner);
-    } else {
-        myTeamBonusSum = CalcRawBonusValue(*this, me) + CalcRawBonusValue(*this, partner);
-        myTeamPenaltyRisk = (myTeamClean == 0)
-            ? (CalcRawPenaltyValue(*this, me) + CalcRawPenaltyValue(*this, partner))
-            : 0.0f;
-    }
+    WriteBlockBPulkaCommon(*this, baseDeltas, out);
 
-    out[31] = static_cast<float>(myTeamClean) / 2.0f;
-    out[32] = static_cast<float>(enemyTeamClean) / 2.0f;
-    out[33] = myTeamBonusSum / 500.0f;
-    out[34] = myTeamPenaltyRisk / 500.0f;
-
-    // 40..71: личные и командные контракты
-    int totalBids = 0;
-    for (int rel = 0; rel < kNumPlayers; ++rel) {
-        const PlayerId absP = AbsSeat(rel, me);
-        const int b = bids[absP];
-        const int t = tricksTaken[absP];
-        const bool hasB = (b >= 0);
-        if (hasB) totalBids += b;
-
-        out[40 + rel] = hasB ? (static_cast<float>(b) / 9.0f) : 0.0f;
-        out[44 + rel] = hasB ? 1.0f : 0.0f;
-        out[48 + rel] = static_cast<float>(t) / 9.0f;
-        out[52 + rel] = hasB ? (static_cast<float>(std::max(0, b - t)) / 9.0f) : 0.0f;
-        out[56 + rel] = (hasB && t == b) ? 1.0f : 0.0f;
-        out[60 + rel] = (hasB && t > b) ? 1.0f : 0.0f;
-        out[64 + rel] = (hasB && b > 0 && t == 0) ? 1.0f : 0.0f;
-    }
-
-    const int myBid = std::max<int>(0, bids[me]);
-    const int partnerBid = std::max<int>(0, bids[partner]);
-    const int enemy1Bid = std::max<int>(0, bids[enemyOver]);
-    const int enemy2Bid = std::max<int>(0, bids[enemyUnder]);
-
-    const int myNeed = (bids[me] >= 0) ? std::max(0, bids[me] - tricksTaken[me]) : 0;
-    const int partnerNeed = (bids[partner] >= 0) ? std::max(0, bids[partner] - tricksTaken[partner]) : 0;
-
-    out[68] = static_cast<float>(myBid + partnerBid) / 18.0f;
-    out[69] = static_cast<float>(myNeed + partnerNeed) / 18.0f;
-    out[70] = static_cast<float>(enemy1Bid + enemy2Bid) / 18.0f;
-    out[71] = static_cast<float>(cardsInDeal - totalBids) / 9.0f;
-
-    // 72..119: механика хода и контроль партнёра
-    if (phase == Phase::Bidding && me == dealerPlayer) {
-        int sumOther = 0;
-        for (int p = 0; p < kNumPlayers; ++p) {
-            if (p != me && bids[p] >= 0) sumOther += bids[p];
-        }
-        const int forbidden = cardsInDeal - sumOther;
-        if (forbidden >= 0 && forbidden <= cardsInDeal) {
-            out[72 + forbidden] = 1.0f;
-        }
-    }
-
-    out[82 + std::to_underlying(trumpSuit)] = 1.0f;
-
-    Suit reqSuit = Suit::None;
-    bool forceHigh = false;
-    if (phase == Phase::TrickPlay && cardsInCurrentTrick > 0) {
-        const auto& leadPlay = currentTrick[0].play;
-        const Card& leadCard = GetCard(leadPlay.cardId);
-        reqSuit = leadCard.IsJoker() ? leadPlay.requestedSuit : leadCard.suit;
-        forceHigh = leadCard.IsJoker() && (leadPlay.jokerAction == JokerAction::LeadHighSuit);
-    }
-    out[87 + std::to_underlying(reqSuit)] = 1.0f;
-
-    out[92] = static_cast<float>(cardsInCurrentTrick) / 3.0f;
-    out[93] = forceHigh ? 1.0f : 0.0f;
-    out[94] = (phase == Phase::TrickPlay && cardsInCurrentTrick == 0) ? 1.0f : 0.0f;
-
-    if (phase == Phase::TrickPlay && cardsInCurrentTrick > 0) {
-        const PlayerId curWinner = DeterminePartialTrickWinner(currentTrick, cardsInCurrentTrick, trumpSuit);
-        out[95] = (curWinner == partner) ? 1.0f : 0.0f;
-    }
-
-    for (uint8_t i = 0; i < cardsInCurrentTrick && i < 3; ++i) {
-        const int base = 96 + i * 8;
-        out[base + RelSeat(currentTrick[i].player, me)] = 1.0f;
-        const JokerAction ja = currentTrick[i].play.jokerAction;
-        if (ja != JokerAction::None) {
-            out[base + 4 + (std::to_underlying(ja) - 1)] = 1.0f;
-        }
-    }
-
-    WriteCardsAndMemoryBlock(*this, out);
+    WriteBlockC(*this, h, out);
+    WriteBlockD(*this, out);
 }
 
 void GameStateView::WriteTensor(float* outBuffer) const noexcept {

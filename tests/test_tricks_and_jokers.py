@@ -1,8 +1,10 @@
 from conftest import (
-    lib, RULES_POPULAR, RULES_CLASSIC, MODE_LONG,
-    SUIT_SPADES, SUIT_CLUBS, SUIT_DIAMONDS, SUIT_HEARTS,
-    RANK_6, RANK_7, RANK_8, RANK_KING, RANK_ACE, JK1, JK2,
-    cid, legal_actions, make_custom_deck, get_snap, get_scores
+    lib, RULES_POPULAR, MODE_LONG,
+    SUIT_SPADES, SUIT_DIAMONDS, SUIT_HEARTS,
+    RANK_6, RANK_7, RANK_KING, RANK_ACE, JK1, JK2,
+    ACT_JOKER_PLAY_WIN, ACT_JOKER_PLAY_LOW,
+    ACT_JOKER_LEAD_HIGH_BASE, ACT_JOKER_LEAD_LOW_BASE,
+    cid, make_custom_deck, get_scores
 )
 
 
@@ -21,8 +23,7 @@ def test_joker_lead_high_suit_trumped_by_void_opponent(make_env):
     for b in (0, 0, 1, 1):
         lib.joker_step(env, b)
 
-    # P1: JK1 по высшей Пике (36 + SUIT_SPADES)
-    assert lib.joker_step(env, 36 + SUIT_SPADES) == 1
+    assert lib.joker_step(env, ACT_JOKER_LEAD_HIGH_BASE + SUIT_SPADES) == 1
     assert lib.joker_step(env, cid(SUIT_SPADES, RANK_ACE)) == 1
     assert lib.joker_step(env, cid(SUIT_HEARTS, RANK_6)) == 1
     assert lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_ACE)) == 1
@@ -34,19 +35,19 @@ def test_joker_lead_high_suit_trumped_by_void_opponent(make_env):
 def test_joker_lead_low_suit_loses_to_ordered_suit(make_env):
     env = make_env(rules=RULES_POPULAR, mode=MODE_LONG, seed=2)
     deck = make_custom_deck([
-        cid(SUIT_DIAMONDS, RANK_6),    # P0 (дилер)
-        JK1,                           # P1 (ходит первым по меньшей Пике: 40 + SUIT_SPADES)
-        cid(SUIT_SPADES, RANK_7),      # P2 (есть 7♠ -> забирает взятку у JK1 LeadLow!)
-        cid(SUIT_DIAMONDS, RANK_7),    # P3
-        cid(SUIT_HEARTS, RANK_KING),   # upcard -> Червы
+        cid(SUIT_DIAMONDS, RANK_6),   # P0 (дилер)
+        JK1,                          # P1 (LeadLow Пики = 42 + 0)
+        cid(SUIT_SPADES, RANK_7),     # P2 (7♠ забирает у LeadLow!)
+        cid(SUIT_DIAMONDS, RANK_7),   # P3
+        cid(SUIT_HEARTS, RANK_KING),  # upcard -> Червы
     ])
     lib.joker_force_deck_order(env, deck)
     lib.joker_reset(env, RULES_POPULAR, MODE_LONG, 0, 0, 2)
 
-    for b in (0, 1, 0, 0):
-        lib.joker_step(env, b)
+    for b in (0, 1, 0, 1):
+        assert lib.joker_step(env, b) == 1
 
-    assert lib.joker_step(env, 40 + SUIT_SPADES) == 1
+    assert lib.joker_step(env, ACT_JOKER_LEAD_LOW_BASE + SUIT_SPADES) == 1
     assert lib.joker_step(env, cid(SUIT_SPADES, RANK_7)) == 1
     assert lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_7)) == 1
     assert lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_6)) == 1
@@ -60,8 +61,8 @@ def test_two_jokers_play_win_second_takes_trick(make_env):
     deck = make_custom_deck([
         cid(SUIT_DIAMONDS, RANK_6),   # P0 (дилер)
         cid(SUIT_SPADES, RANK_7),     # P1
-        JK1,                          # P2 (PlayWin = 44)
-        JK2,                          # P3 (PlayWin = 44 -> побеждает)
+        JK1,                          # P2 (PlayWin = 36)
+        JK2,                          # P3 (PlayWin = 36 -> побеждает!)
         cid(SUIT_HEARTS, RANK_KING),  # upcard
     ])
     lib.joker_force_deck_order(env, deck)
@@ -70,10 +71,10 @@ def test_two_jokers_play_win_second_takes_trick(make_env):
     for b in (0, 0, 1, 1):
         lib.joker_step(env, b)
 
-    lib.joker_step(env, cid(SUIT_SPADES, RANK_7))
-    lib.joker_step(env, 44)
-    lib.joker_step(env, 44)
-    lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_6))
+    assert lib.joker_step(env, cid(SUIT_SPADES, RANK_7)) == 1
+    assert lib.joker_step(env, ACT_JOKER_PLAY_WIN) == 1
+    assert lib.joker_step(env, ACT_JOKER_PLAY_WIN) == 1
+    assert lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_6)) == 1
 
     scores = get_scores(env)
     assert scores[3] == 100 and scores[2] == 50
@@ -83,8 +84,8 @@ def test_joker_play_low_always_loses(make_env):
     env = make_env(rules=RULES_POPULAR, mode=MODE_LONG, seed=4)
     deck = make_custom_deck([
         cid(SUIT_DIAMONDS, RANK_6),   # P0 (дилер)
-        cid(SUIT_SPADES, RANK_7),     # P1 (забирает взятку семёркой!)
-        JK1,                          # P2 (сбрасывает Джокера по дну: PlayLow = 45)
+        cid(SUIT_SPADES, RANK_7),     # P1 (забирает семёркой!)
+        JK1,                          # P2 (PlayLow = 37)
         cid(SUIT_DIAMONDS, RANK_7),   # P3
         cid(SUIT_HEARTS, RANK_KING),  # upcard
     ])
@@ -94,10 +95,10 @@ def test_joker_play_low_always_loses(make_env):
     for b in (1, 0, 0, 1):
         lib.joker_step(env, b)
 
-    lib.joker_step(env, cid(SUIT_SPADES, RANK_7))
-    lib.joker_step(env, 45)
-    lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_7))
-    lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_6))
+    assert lib.joker_step(env, cid(SUIT_SPADES, RANK_7)) == 1
+    assert lib.joker_step(env, ACT_JOKER_PLAY_LOW) == 1
+    assert lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_7)) == 1
+    assert lib.joker_step(env, cid(SUIT_DIAMONDS, RANK_6)) == 1
 
     scores = get_scores(env)
     assert scores[1] == 100 and scores[2] == 50

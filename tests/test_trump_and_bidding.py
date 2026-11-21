@@ -60,6 +60,5 @@ def test_visyak_dealer_restriction_and_tensor(make_env):
     acts = legal_actions(lib.joker_get_legal_actions_mask(env))
     assert acts == [0], f"Висяк 1 должен быть запрещён, доступно: {acts}"
 
-    # Вектор наблюдения дилера: индекс 68 + 1 = 69 (запрещённый висяк = 1)
     obs = get_obs_vec(env, 0)
-    assert obs[69] == 1.0 and obs[68] == 0.0
+    assert obs[71] == 1.0 and obs[70] == 0.0

@@ -5,8 +5,47 @@
 #include <span>
 #include <utility>
 
+struct UndoEntry {
+    joker::engine::JokerEngine engine{};
+    joker::engine::DealHistoryBuffer history{};
+};
+
 struct JokerEnvHandle {
-    joker::engine::JokerEngine engine;
+    static constexpr size_t kMaxUndo = 64;
+
+    joker::engine::JokerEngine engine{};
+    joker::engine::DealHistoryBuffer history{};
+    std::array<UndoEntry, kMaxUndo> undoRing{};
+    size_t undoHead{0};
+    uint32_t undoCount{0};
+
+    explicit JokerEnvHandle(const joker::engine::JokerEngine& eng) noexcept
+        : engine(eng) {}
+
+    void ClearHistoryAndUndo() noexcept {
+        history.Clear();
+        undoHead = 0;
+        undoCount = 0;
+    }
+
+    void PushUndo() noexcept {
+        undoRing[undoHead] = UndoEntry{engine, history};
+        undoHead = (undoHead + 1U) % kMaxUndo;
+        if (undoCount < kMaxUndo) {
+            ++undoCount;
+        }
+    }
+
+    bool PopUndo() noexcept {
+        if (undoCount == 0U) {
+            return false;
+        }
+        undoHead = (undoHead + kMaxUndo - 1U) % kMaxUndo;
+        --undoCount;
+        engine = undoRing[undoHead].engine;
+        history = undoRing[undoHead].history;
+        return true;
+    }
 };
 
 struct JokerVecEnvHandle {
@@ -31,9 +70,40 @@ constexpr joker::core::PulkaMode ParsePulkaMode(uint8_t v) noexcept {
     return (v == 1U) ? joker::core::PulkaMode::Soft : joker::core::PulkaMode::Strict;
 }
 
+constexpr JokerStepError ToCError(joker::core::StepError err) noexcept {
+    return static_cast<JokerStepError>(std::to_underlying(err));
+}
+
 template <typename T>
 constexpr std::span<T> MakeSpan(T* ptr, size_t count) noexcept {
     return ptr ? std::span<T>(ptr, count) : std::span<T>{};
+}
+
+inline JokerStepError ExecuteSingleEnvStepChecked(JokerEnvHandle* env, uint8_t action_id) noexcept {
+    if (!env) {
+        return JOKER_ERR_NULL_HANDLE;
+    }
+    const joker::core::StepError err = env->engine.ValidateAction(action_id);
+    if (err != joker::core::StepError::Ok) {
+        return ToCError(err);
+    }
+
+    env->PushUndo();
+
+    const joker::core::GameState& stBefore = env->engine.GetState();
+    const int prevDeal = stBefore.dealNumber;
+    const auto ev = joker::engine::DealHistoryBuffer::MakeEvent(stBefore, action_id);
+
+    env->engine.Step(action_id);
+
+    const bool dealChanged = env->engine.IsDone() || (env->engine.GetState().dealNumber != prevDeal);
+    if (dealChanged) {
+        env->history.Clear();
+    } else if (ev.eventType != 0U) {
+        env->history.Push(ev);
+    }
+
+    return JOKER_ERR_OK;
 }
 
 } // namespace
@@ -46,14 +116,13 @@ JokerEnvHandle* joker_create(
     uint8_t team_mode,
     uint8_t pulka_mode,
     uint64_t seed) {
-    return new JokerEnvHandle{
+    return new JokerEnvHandle(
         joker::engine::JokerEngine(
             ParseRulePreset(rules_preset),
             seed,
             ParseMatchMode(match_mode),
             ParseTeamMode(team_mode),
-            ParsePulkaMode(pulka_mode))
-    };
+            ParsePulkaMode(pulka_mode)));
 }
 
 void joker_destroy(JokerEnvHandle* env) {
@@ -62,7 +131,9 @@ void joker_destroy(JokerEnvHandle* env) {
 
 JokerEnvHandle* joker_clone(const JokerEnvHandle* env) {
     if (!env) return nullptr;
-    return new JokerEnvHandle{*env};
+    auto* cloned = new JokerEnvHandle(env->engine);
+    cloned->history = env->history;
+    return cloned;
 }
 
 JokerEnvHandle* joker_clone_determinized(
@@ -70,7 +141,8 @@ JokerEnvHandle* joker_clone_determinized(
     uint8_t observer_player,
     uint64_t rng_seed) {
     if (!env) return nullptr;
-    auto* cloned = new JokerEnvHandle{*env};
+    auto* cloned = new JokerEnvHandle(env->engine);
+    cloned->history = env->history;
     cloned->engine.Determinize(observer_player % 4U, rng_seed);
     return cloned;
 }
@@ -97,6 +169,7 @@ void joker_reset(
         ParseMatchMode(match_mode),
         ParseTeamMode(team_mode),
         ParsePulkaMode(pulka_mode));
+    env->ClearHistoryAndUndo();
 }
 
 void joker_reset256(
@@ -113,11 +186,66 @@ void joker_reset256(
         ParseMatchMode(match_mode),
         ParseTeamMode(team_mode),
         ParsePulkaMode(pulka_mode));
+    env->ClearHistoryAndUndo();
 }
 
 void joker_force_deck_order(JokerEnvHandle* env, const uint8_t cards38[38]) {
     if (!env || !cards38) return;
     env->engine.ForceDeckOrder(std::span<const uint8_t, joker::core::kMaxDeckSize>(cards38, 38));
+}
+
+void joker_begin_observed_match(
+    JokerEnvHandle* env,
+    uint8_t rules_preset,
+    uint8_t match_mode,
+    uint8_t team_mode,
+    uint8_t pulka_mode,
+    uint8_t dealer,
+    uint8_t hero_seat) {
+    if (!env) return;
+    env->engine.BeginObservedMatch(
+        ParseRulePreset(rules_preset),
+        ParseMatchMode(match_mode),
+        ParseTeamMode(team_mode),
+        ParsePulkaMode(pulka_mode),
+        dealer % 4U,
+        hero_seat % 4U);
+    env->ClearHistoryAndUndo();
+}
+
+int joker_set_observed_deal(
+    JokerEnvHandle* env,
+    uint64_t hero_hand_mask,
+    uint8_t upcard_or_invalid,
+    uint8_t trump_suit_or_none) {
+    if (!env) return 0;
+    const UndoEntry backup{env->engine, env->history};
+    if (!env->engine.SetObservedDeal(hero_hand_mask, upcard_or_invalid, trump_suit_or_none)) {
+        return 0;
+    }
+    env->undoRing[env->undoHead] = backup;
+    env->undoHead = (env->undoHead + 1U) % JokerEnvHandle::kMaxUndo;
+    if (env->undoCount < JokerEnvHandle::kMaxUndo) {
+        ++env->undoCount;
+    }
+    env->history.Clear();
+    return 1;
+}
+
+int joker_set_observed_remaining_six(
+    JokerEnvHandle* env,
+    uint64_t full_nine_hand_mask) {
+    if (!env) return 0;
+    const UndoEntry backup{env->engine, env->history};
+    if (!env->engine.SetObservedRemainingSix(full_nine_hand_mask)) {
+        return 0;
+    }
+    env->undoRing[env->undoHead] = backup;
+    env->undoHead = (env->undoHead + 1U) % JokerEnvHandle::kMaxUndo;
+    if (env->undoCount < JokerEnvHandle::kMaxUndo) {
+        ++env->undoCount;
+    }
+    return 1;
 }
 
 int joker_is_done(const JokerEnvHandle* env) {
@@ -138,7 +266,39 @@ uint64_t joker_get_legal_actions_mask(const JokerEnvHandle* env) {
 }
 
 int joker_step(JokerEnvHandle* env, uint8_t action_id) {
-    return (env && env->engine.Step(action_id)) ? 1 : 0;
+    return (ExecuteSingleEnvStepChecked(env, action_id) == JOKER_ERR_OK) ? 1 : 0;
+}
+
+JokerStepError joker_validate_action(const JokerEnvHandle* env, uint8_t action_id) {
+    if (!env) return JOKER_ERR_NULL_HANDLE;
+    return ToCError(env->engine.ValidateAction(action_id));
+}
+
+JokerStepError joker_step_checked(JokerEnvHandle* env, uint8_t action_id) {
+    return ExecuteSingleEnvStepChecked(env, action_id);
+}
+
+int joker_undo(JokerEnvHandle* env) {
+    return (env && env->PopUndo()) ? 1 : 0;
+}
+
+uint32_t joker_can_undo_steps(const JokerEnvHandle* env) {
+    return env ? env->undoCount : 0U;
+}
+
+void joker_write_history_tokens(
+    const JokerEnvHandle* env,
+    uint8_t observer_player,
+    int16_t* out_tokens,
+    uint8_t* out_length) {
+    if (!env || !out_tokens) return;
+    env->history.WriteTokens(observer_player % 4U, out_tokens, out_length);
+}
+
+uint8_t joker_select_heuristic_action(const JokerEnvHandle* env, uint64_t rng_seed) {
+    if (!env) return 0U;
+    uint64_t rng = (rng_seed == 0ULL) ? 0x9E3779B97F4A7C15ULL : rng_seed;
+    return joker::engine::JokerVectorEnv::SelectHeuristicAction(env->engine, rng);
 }
 
 size_t joker_tensor_size(void) {
@@ -252,12 +412,32 @@ size_t joker_vec_size(const JokerVecEnvHandle* vec_env) {
 void joker_vec_set_reward_config(JokerVecEnvHandle* vec_env, const JokerRewardConfig* config) {
     if (!vec_env || !config) return;
     vec_env->vec_env.SetRewardConfig(joker::engine::RewardConfig{
-        .scoreScale      = config->score_scale,
-        .relativeWeight  = config->relative_weight,
-        .matchWinBonus   = config->match_win_bonus,
-        .dealExactBonus  = config->deal_exact_bonus,
+        .scoreScale = config->score_scale,
+        .relativeWeight = config->relative_weight,
+        .matchWinBonus = config->match_win_bonus,
+        .dealExactBonus = config->deal_exact_bonus,
         .trickWinShaping = config->trick_win_shaping
     });
+}
+
+void joker_vec_set_auto_reset(JokerVecEnvHandle* vec_env, int enabled) {
+    if (!vec_env) return;
+    vec_env->vec_env.SetAutoReset(enabled != 0);
+}
+
+void joker_vec_set_stats_enabled(JokerVecEnvHandle* vec_env, int enabled) {
+    if (!vec_env) return;
+    vec_env->vec_env.SetStatsEnabled(enabled != 0);
+}
+
+void joker_vec_reset_stats(JokerVecEnvHandle* vec_env) {
+    if (!vec_env) return;
+    vec_env->vec_env.ResetStats();
+}
+
+void joker_vec_get_stats(const JokerVecEnvHandle* vec_env, JokerPlayerStats out_stats4[4]) {
+    if (!vec_env || !out_stats4) return;
+    vec_env->vec_env.GetAggregatedStats(std::span<JokerPlayerStats, 4>(out_stats4, 4));
 }
 
 void joker_vec_reset(
@@ -274,6 +454,23 @@ void joker_vec_reset(
         ParseMatchMode(match_mode),
         ParseTeamMode(team_mode),
         ParsePulkaMode(pulka_mode));
+}
+
+void joker_vec_reset_with_seeds(
+    JokerVecEnvHandle* vec_env,
+    uint8_t rules_preset,
+    uint8_t match_mode,
+    uint8_t team_mode,
+    uint8_t pulka_mode,
+    const uint64_t* seeds_per_env) {
+    if (!vec_env || !seeds_per_env) return;
+    const size_t n = vec_env->vec_env.Size();
+    vec_env->vec_env.ResetWithSeeds(
+        ParseRulePreset(rules_preset),
+        ParseMatchMode(match_mode),
+        ParseTeamMode(team_mode),
+        ParsePulkaMode(pulka_mode),
+        std::span<const uint64_t>(seeds_per_env, n));
 }
 
 void joker_vec_fork_from_env(
@@ -295,7 +492,8 @@ void joker_vec_fork_from_env(
         base_seed,
         MakeSpan(out_obs_batch, n * kObsDim),
         MakeSpan(out_legal_masks, n),
-        MakeSpan(out_oracle_batch, n * kOracleDim));
+        MakeSpan(out_oracle_batch, n * kOracleDim),
+        &root_env->history);
 }
 
 void joker_vec_get_observations(
