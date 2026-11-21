@@ -45,9 +45,13 @@ set(JOKER_CORE_SOURCES
         src/core/Card.cpp
         src/core/Deck.cpp
         src/core/GameState.cpp
+        src/engine/ArenaStats.cpp
+        src/engine/DealHistory.cpp
+        src/engine/Determinizer.cpp
         src/engine/HeuristicBot.cpp
         src/engine/JokerEngine.cpp
         src/engine/JokerVectorEnv.cpp
+        src/engine/TensorEncoder.cpp
         src/joker_c_api.cpp
 )
 

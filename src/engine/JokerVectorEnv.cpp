@@ -1,24 +1,16 @@
 #include "engine/JokerVectorEnv.hpp"
+#include "engine/HeuristicBot.hpp"
 #include <algorithm>
 #include <bit>
-#include <limits>
 #include <random>
 #include <thread>
 #include <utility>
-#include "engine/HeuristicBot.hpp"
-
-#ifdef _OPENMP
-#endif
 
 namespace joker::engine {
 
 using namespace joker::core;
 
 namespace {
-
-constexpr uint8_t RelSeat1Based(const PlayerId absSeat, const PlayerId observer) noexcept {
-    return static_cast<uint8_t>(((static_cast<int>(absSeat) - static_cast<int>(observer) + kNumPlayers) % kNumPlayers) + 1);
-}
 
 inline ActionId ExecuteAndRecordStep(EnvSlot& slot, ActionId requestedAction) noexcept {
     JokerEngine& env = slot.engine;
@@ -39,93 +31,6 @@ inline ActionId ExecuteAndRecordStep(EnvSlot& slot, ActionId requestedAction) no
 }
 
 } // namespace
-
-// ============================================================================
-// DealHistoryBuffer
-// ============================================================================
-
-DealHistoryBuffer::RawEvent DealHistoryBuffer::MakeEvent(
-    const GameState& stBefore,
-    const ActionId action) noexcept {
-    RawEvent ev{};
-    ev.absPlayer = stBefore.currentPlayer;
-    ev.actionId = action;
-
-    if (stBefore.phase == Phase::ChoosingTrump) {
-        ev.eventType = 1U;
-        ev.suit = action; // 0..4
-    } else if (stBefore.phase == Phase::Bidding) {
-        ev.eventType = 2U;
-        ev.suit = 255U;
-    } else if (stBefore.phase == Phase::TrickPlay) {
-        ev.eventType = 3U;
-        const PlayerId actor = stBefore.currentPlayer;
-        const HandMask availMask = stBefore.IsHandKnown(actor)
-            ? stBefore.hands[actor]
-            : rules::ComputePossibleCardsForUnknownHand(stBefore, actor);
-        const CardPlay play = DecodeCardPlayAction(action, availMask);
-        ev.cardId = play.cardId;
-        ev.jokerAction = std::to_underlying(play.jokerAction);
-        const Card& c = GetCard(play.cardId);
-        ev.suit = c.IsJoker() ? std::to_underlying(play.requestedSuit) : std::to_underlying(c.suit);
-        ev.trickIdx = static_cast<uint8_t>(stBefore.tricksCompletedInDeal);
-        ev.posInTrick = stBefore.cardsInCurrentTrick;
-    }
-
-    return ev;
-}
-
-void DealHistoryBuffer::WriteTokens(const PlayerId observer, int16_t* outTokens, uint8_t* outLength) const noexcept {
-    constexpr size_t kTotalInts = kMaxSeqLen * kTokenDim;
-    std::fill_n(outTokens, kTotalInts, static_cast<int16_t>(0));
-
-    for (uint8_t i = 0; i < count; ++i) {
-        const RawEvent& ev = events[i];
-        int16_t* dst = outTokens + static_cast<size_t>(i) * kTokenDim;
-
-        dst[0] = static_cast<int16_t>(ev.eventType);                          // 1..3 (0 = PAD)
-        dst[1] = static_cast<int16_t>(RelSeat1Based(ev.absPlayer, observer)); // 1..4
-        dst[2] = static_cast<int16_t>(ev.actionId + 1U);                      // 1..46
-        dst[3] = (ev.cardId < kMaxDeckSize)
-            ? static_cast<int16_t>(ev.cardId + 1U)
-            : static_cast<int16_t>(0);                                        // 1..38 или 0
-        dst[4] = (ev.suit <= 4U)
-            ? static_cast<int16_t>(ev.suit + 1U)
-            : static_cast<int16_t>(0);                                        // 1..5 или 0
-        dst[5] = (ev.eventType == 3U)
-            ? static_cast<int16_t>(ev.jokerAction + 1U)
-            : static_cast<int16_t>(0);                                        // 1..5 или 0
-        dst[6] = (ev.trickIdx < 9U)
-            ? static_cast<int16_t>(ev.trickIdx + 1U)
-            : static_cast<int16_t>(0);                                        // 1..9 или 0
-        dst[7] = (ev.posInTrick < 4U)
-            ? static_cast<int16_t>(ev.posInTrick + 1U)
-            : static_cast<int16_t>(0);                                        // 1..4 или 0
-    }
-
-    if (outLength) {
-        *outLength = count;
-    }
-}
-
-// ============================================================================
-// SlotStats
-// ============================================================================
-
-void SlotStats::Reset() noexcept {
-    for (int p = 0; p < kNumPlayers; ++p) {
-        players[p] = JokerPlayerStats{};
-        players[p].max_match_score = std::numeric_limits<int32_t>::min();
-        players[p].min_match_score = std::numeric_limits<int32_t>::max();
-        players[p].max_deal_score = std::numeric_limits<int32_t>::min();
-        players[p].min_deal_score = std::numeric_limits<int32_t>::max();
-    }
-    matchBonusesCount.fill(0U);
-}
-
-// ============================================================================
-// JokerVectorEnv
-// ============================================================================
 
 JokerVectorEnv::JokerVectorEnv(
     size_t numEnvs,
@@ -162,218 +67,7 @@ void JokerVectorEnv::ResetStats() noexcept {
 }
 
 void JokerVectorEnv::GetAggregatedStats(std::span<JokerPlayerStats, kNumPlayers> outStats) const noexcept {
-    for (int p = 0; p < kNumPlayers; ++p) {
-        outStats[p] = JokerPlayerStats{};
-        outStats[p].max_match_score = std::numeric_limits<int32_t>::min();
-        outStats[p].min_match_score = std::numeric_limits<int32_t>::max();
-        outStats[p].max_deal_score = std::numeric_limits<int32_t>::min();
-        outStats[p].min_deal_score = std::numeric_limits<int32_t>::max();
-    }
-
-    for (const auto& ss : slotStats_) {
-        for (int p = 0; p < kNumPlayers; ++p) {
-            const JokerPlayerStats& src = ss.players[p];
-            JokerPlayerStats& dst = outStats[p];
-
-            dst.matches_played += src.matches_played;
-            for (int r = 0; r < 4; ++r) {
-                dst.place_counts[r] += src.place_counts[r];
-            }
-            dst.place_points += src.place_points;
-            dst.total_match_score_sum += src.total_match_score_sum;
-            dst.total_match_score_sq_sum += src.total_match_score_sq_sum;
-            if (src.matches_played > 0) {
-                dst.max_match_score = std::max(dst.max_match_score, src.max_match_score);
-                dst.min_match_score = std::min(dst.min_match_score, src.min_match_score);
-            }
-
-            dst.deals_played += src.deals_played;
-            if (src.deals_played > 0) {
-                dst.max_deal_score = std::max(dst.max_deal_score, src.max_deal_score);
-                dst.min_deal_score = std::min(dst.min_deal_score, src.min_deal_score);
-            }
-            dst.exact_bids += src.exact_bids;
-            dst.overbids += src.overbids;
-            dst.underbids += src.underbids;
-            dst.shangas += src.shangas;
-            dst.large_bids_count += src.large_bids_count;
-            dst.large_bids_exact += src.large_bids_exact;
-
-            dst.deals_1_8_count += src.deals_1_8_count;
-            dst.bids_sum_1_8 += src.bids_sum_1_8;
-            dst.tricks_sum_1_8 += src.tricks_sum_1_8;
-            dst.deals_9_count += src.deals_9_count;
-            dst.bids_sum_9 += src.bids_sum_9;
-            dst.tricks_sum_9 += src.tricks_sum_9;
-
-            dst.nines_trump_choices += src.nines_trump_choices;
-            dst.nines_no_trump_choices += src.nines_no_trump_choices;
-
-            dst.joker_lead_high += src.joker_lead_high;
-            dst.joker_lead_low += src.joker_lead_low;
-            dst.joker_play_win += src.joker_play_win;
-            dst.joker_play_low += src.joker_play_low;
-
-            dst.pulkas_played += src.pulkas_played;
-            dst.pulkas_clean += src.pulkas_clean;
-            dst.pulkas_bonus_received += src.pulkas_bonus_received;
-            dst.pulkas_penalty_received += src.pulkas_penalty_received;
-            dst.matches_multi_bonus += src.matches_multi_bonus;
-        }
-    }
-
-    for (int p = 0; p < kNumPlayers; ++p) {
-        if (outStats[p].matches_played == 0) {
-            outStats[p].max_match_score = 0;
-            outStats[p].min_match_score = 0;
-        }
-        if (outStats[p].deals_played == 0) {
-            outStats[p].max_deal_score = 0;
-            outStats[p].min_deal_score = 0;
-        }
-    }
-}
-
-void JokerVectorEnv::RecordStepStats(
-    const size_t envIdx,
-    const Phase prevPhase,
-    const PlayerId actor,
-    const ActionId action,
-    const int prevDeal,
-    const int prevCardsInDeal,
-    const std::array<int8_t, kNumPlayers>& prevBids,
-    const std::array<int8_t, kNumPlayers>& finalDealTricks,
-    const std::array<int32_t, kNumPlayers>& prevScores,
-    const std::array<int32_t, kNumPlayers>& afterScores,
-    const std::array<bool, kNumPlayers>& prevPulkaClean,
-    const bool dealDone,
-    const bool matchDone) noexcept {
-    SlotStats& ss = slotStats_[envIdx];
-
-    if (prevPhase == Phase::ChoosingTrump) {
-        ss.players[actor].nines_trump_choices++;
-        if (action == std::to_underlying(Suit::None)) {
-            ss.players[actor].nines_no_trump_choices++;
-        }
-    } else if (prevPhase == Phase::TrickPlay && action >= 36U) {
-        if (action == kActionJokerPlayWin) {
-            ss.players[actor].joker_play_win++;
-        } else if (action == kActionJokerPlayLow) {
-            ss.players[actor].joker_play_low++;
-        } else if (action >= kActionJokerLeadHighBase && action < kActionJokerLeadHighBase + 4U) {
-            ss.players[actor].joker_lead_high++;
-        } else if (action >= kActionJokerLeadLowBase && action < kActionJokerLeadLowBase + 4U) {
-            ss.players[actor].joker_lead_low++;
-        }
-    }
-
-    if (dealDone) {
-        const auto& sched = GetScheduleEntry(mode_, prevDeal);
-        for (int p = 0; p < kNumPlayers; ++p) {
-            JokerPlayerStats& st = ss.players[p];
-            const int b = prevBids[p];
-            const int t = finalDealTricks[p];
-            const int32_t dealScore = static_cast<int32_t>(
-                rules::CalculateDealScore(preset_, b, t, prevCardsInDeal));
-
-            st.deals_played++;
-            st.max_deal_score = std::max(st.max_deal_score, dealScore);
-            st.min_deal_score = std::min(st.min_deal_score, dealScore);
-
-            if (t == b) {
-                st.exact_bids++;
-            } else if (t > b) {
-                st.overbids++;
-            } else {
-                st.underbids++;
-                if (b > 0 && t == 0) {
-                    st.shangas++;
-                }
-            }
-
-            if (b >= 4) {
-                st.large_bids_count++;
-                if (t == b) {
-                    st.large_bids_exact++;
-                }
-            }
-
-            if (prevCardsInDeal == 9) {
-                st.deals_9_count++;
-                st.bids_sum_9 += static_cast<uint64_t>(std::max(0, b));
-                st.tricks_sum_9 += static_cast<uint64_t>(std::max(0, t));
-            } else {
-                st.deals_1_8_count++;
-                st.bids_sum_1_8 += static_cast<uint64_t>(std::max(0, b));
-                st.tricks_sum_1_8 += static_cast<uint64_t>(std::max(0, t));
-            }
-
-            if (sched.isPulkaEnd) {
-                st.pulkas_played++;
-                if (prevPulkaClean[p] && (b == t)) {
-                    st.pulkas_clean++;
-                }
-                const int32_t pulkaDelta = (afterScores[p] - prevScores[p]) - dealScore;
-                if (pulkaDelta > 0) {
-                    st.pulkas_bonus_received++;
-                    ss.matchBonusesCount[p]++;
-                } else if (pulkaDelta < 0) {
-                    st.pulkas_penalty_received++;
-                }
-            }
-        }
-    }
-
-    if (matchDone) {
-        if (teamMode_ == TeamMode::Pairs) {
-            const int32_t teamA = afterScores[0] + afterScores[2];
-            const int32_t teamB = afterScores[1] + afterScores[3];
-            for (int p = 0; p < kNumPlayers; ++p) {
-                const bool isA = (p == 0 || p == 2);
-                const int32_t myTeam = isA ? teamA : teamB;
-                const int32_t oppTeam = isA ? teamB : teamA;
-                if (myTeam > oppTeam) {
-                    ss.players[p].place_counts[0]++;
-                    ss.players[p].place_points += 1.0;
-                } else if (myTeam < oppTeam) {
-                    ss.players[p].place_counts[1]++;
-                } else {
-                    ss.players[p].place_counts[0]++;
-                    ss.players[p].place_points += 0.5;
-                }
-            }
-        } else {
-            for (int p = 0; p < kNumPlayers; ++p) {
-                int strictlyBetter = 0;
-                int equalCount = 0;
-                for (int q = 0; q < kNumPlayers; ++q) {
-                    if (afterScores[q] > afterScores[p]) {
-                        ++strictlyBetter;
-                    } else if (afterScores[q] == afterScores[p]) {
-                        ++equalCount;
-                    }
-                }
-                ss.players[p].place_counts[static_cast<size_t>(strictlyBetter)]++;
-                if (strictlyBetter == 0) {
-                    ss.players[p].place_points += 1.0 / static_cast<double>(equalCount);
-                }
-            }
-        }
-
-        for (int p = 0; p < kNumPlayers; ++p) {
-            JokerPlayerStats& st = ss.players[p];
-            const int32_t sc = afterScores[p];
-            st.matches_played++;
-            st.total_match_score_sum += static_cast<int64_t>(sc);
-            st.total_match_score_sq_sum += static_cast<double>(sc) * static_cast<double>(sc);
-            st.max_match_score = std::max(st.max_match_score, sc);
-            st.min_match_score = std::min(st.min_match_score, sc);
-            if (ss.matchBonusesCount[p] >= 2U) {
-                st.matches_multi_bonus++;
-            }
-            ss.matchBonusesCount[p] = 0U;
-        }
-    }
+    AggregateSlotStats(slotStats_, outStats);
 }
 
 void JokerVectorEnv::GenerateEnvSeed256(
@@ -469,7 +163,6 @@ void JokerVectorEnv::ForkAndDeterminize(
     constexpr size_t kObsStride = GameStateView::kTensorSize;
     const PlayerId obsSeat = static_cast<PlayerId>(observer % kNumPlayers);
 
-    // Синхронизируем режимы пула с клонируемой партией
     preset_ = rootEngine.GetState().rules;
     mode_ = rootEngine.GetState().mode;
     teamMode_ = rootEngine.GetState().teamMode;
@@ -504,21 +197,6 @@ void JokerVectorEnv::ForkAndDeterminize(
         }
         if (!outOracleBatch.empty()) {
             WriteOracleTensor(slot.engine.GetState(), obsSeat, outOracleBatch.data() + idx * kOracleTensorSize);
-        }
-    }
-}
-
-void JokerVectorEnv::WriteOracleTensor(
-    const GameState& state,
-    const PlayerId observer,
-    float* outOracle) noexcept {
-    std::fill_n(outOracle, kOracleTensorSize, 0.0f);
-    for (int rel = 0; rel < kNumPlayers; ++rel) {
-        const PlayerId absP = static_cast<PlayerId>((static_cast<int>(observer) + rel) % kNumPlayers);
-        const HandMask h = state.hands[absP];
-        float* dst = outOracle + static_cast<size_t>(rel) * kMaxDeckSize;
-        for (size_t id = 0; id < kMaxDeckSize; ++id) {
-            dst[id] = ((h & (1ULL << id)) != 0ULL) ? 1.0f : 0.0f;
         }
     }
 }
@@ -737,15 +415,15 @@ void JokerVectorEnv::StepBatch(
         const bool dealDone = matchDone || (stAfter.dealNumber != prevDeal);
         const bool trickCompleted = wasLastTrickCard && (dealDone || stAfter.tricksCompletedInDeal != prevTricksCompleted);
 
-        // Восстанавливаем истинное tricksTaken завершённой взятки/сдачи ДО сброса в BeginDeal
         auto effectiveTricks = prevTricks;
         if (trickCompleted) {
             effectiveTricks[stAfter.lastTrickWinner]++;
         }
 
         if (collectStats_) {
-            RecordStepStats(
-                idx, prevPhase, actor, executedAct, prevDeal, prevCardsInDeal,
+            RecordSlotStepStats(
+                slotStats_[idx], preset_, mode_, teamMode_,
+                prevPhase, actor, executedAct, prevDeal, prevCardsInDeal,
                 prevBids, effectiveTricks, prevScores, afterScores, prevPulkaClean,
                 dealDone, matchDone);
         }
@@ -753,15 +431,9 @@ void JokerVectorEnv::StepBatch(
         if (!outRewards.empty()) {
             std::array<float, kNumPlayers> stepRewards{};
             ComputeStepRewards(
-                prevScores,
-                afterScores,
-                trickCompleted && !dealDone,
-                stAfter.lastTrickWinner,
-                prevBids,
-                effectiveTricks,
-                dealDone,
-                matchDone,
-                stepRewards);
+                prevScores, afterScores, trickCompleted && !dealDone,
+                stAfter.lastTrickWinner, prevBids, effectiveTricks,
+                dealDone, matchDone, stepRewards);
 
             float* rPtr = outRewards.data() + idx * kNumPlayers;
             for (int p = 0; p < kNumPlayers; ++p) {
@@ -769,12 +441,8 @@ void JokerVectorEnv::StepBatch(
             }
         }
 
-        if (!outDealDones.empty()) {
-            outDealDones[idx] = dealDone ? 1U : 0U;
-        }
-        if (!outMatchDones.empty()) {
-            outMatchDones[idx] = matchDone ? 1U : 0U;
-        }
+        if (!outDealDones.empty()) outDealDones[idx] = dealDone ? 1U : 0U;
+        if (!outMatchDones.empty()) outMatchDones[idx] = matchDone ? 1U : 0U;
         if (!outFinalScores.empty()) {
             int32_t* fPtr = outFinalScores.data() + idx * kNumPlayers;
             for (int p = 0; p < kNumPlayers; ++p) {
@@ -798,12 +466,8 @@ void JokerVectorEnv::StepBatch(
         if (!outNextObsBatch.empty()) {
             env.WriteObservationTensor(nextP, outNextObsBatch.data() + idx * kObsStride);
         }
-        if (!outNextMasks.empty()) {
-            outNextMasks[idx] = env.GetLegalActionsMask();
-        }
-        if (!outNextPlayers.empty()) {
-            outNextPlayers[idx] = nextP;
-        }
+        if (!outNextMasks.empty()) outNextMasks[idx] = env.GetLegalActionsMask();
+        if (!outNextPlayers.empty()) outNextPlayers[idx] = nextP;
         if (!outNextOracleBatch.empty()) {
             WriteOracleTensor(env.GetState(), nextP, outNextOracleBatch.data() + idx * kOracleTensorSize);
         }
@@ -817,8 +481,8 @@ void JokerVectorEnv::StepBatch(
 }
 
 ActionId JokerVectorEnv::SelectHeuristicAction(
-        const JokerEngine& env,
-        uint64_t& rngState) noexcept {
+    const JokerEngine& env,
+    uint64_t& rngState) noexcept {
     return HeuristicBot::SelectAction(env, rngState);
 }
 
@@ -868,8 +532,9 @@ void JokerVectorEnv::AdvanceToHero(
                 if (trickCompleted) {
                     effectiveTricks[stAfter.lastTrickWinner]++;
                 }
-                RecordStepStats(
-                    idx, prevPhase, actor, executedAct, prevDeal, prevCardsInDeal,
+                RecordSlotStepStats(
+                    slotStats_[idx], preset_, mode_, teamMode_,
+                    prevPhase, actor, executedAct, prevDeal, prevCardsInDeal,
                     prevBids, effectiveTricks, prevScores, stAfter.totalScores, prevPulkaClean,
                     dealDone, matchDone);
             }
@@ -963,23 +628,18 @@ void JokerVectorEnv::StepArena(
             }
 
             if (collectStats_) {
-                RecordStepStats(
-                    idx, prevPhase, actor, executedAct, prevDeal, prevCardsInDeal,
+                RecordSlotStepStats(
+                    slotStats_[idx], preset_, mode_, teamMode_,
+                    prevPhase, actor, executedAct, prevDeal, prevCardsInDeal,
                     prevBids, effectiveTricks, prevScores, afterScores, prevPulkaClean,
                     dealDone, matchDone);
             }
 
             std::array<float, kNumPlayers> stepRewards{};
             ComputeStepRewards(
-                prevScores,
-                afterScores,
-                trickCompleted && !dealDone,
-                stAfter.lastTrickWinner,
-                prevBids,
-                effectiveTricks,
-                dealDone,
-                matchDone,
-                stepRewards);
+                prevScores, afterScores, trickCompleted && !dealDone,
+                stAfter.lastTrickWinner, prevBids, effectiveTricks,
+                dealDone, matchDone, stepRewards);
 
             for (int p = 0; p < kNumPlayers; ++p) {
                 accumRewards[p] += stepRewards[p];
@@ -1017,21 +677,15 @@ void JokerVectorEnv::StepArena(
             }
         }
 
-        if (!outHeroRewards.empty()) {
-            outHeroRewards[idx] = accumRewards[hero];
-        }
+        if (!outHeroRewards.empty()) outHeroRewards[idx] = accumRewards[hero];
         if (!outAllRewards.empty()) {
             float* rPtr = outAllRewards.data() + idx * kNumPlayers;
             for (int p = 0; p < kNumPlayers; ++p) {
                 rPtr[p] = accumRewards[p];
             }
         }
-        if (!outDealDones.empty()) {
-            outDealDones[idx] = anyDealDone ? 1U : 0U;
-        }
-        if (!outMatchDones.empty()) {
-            outMatchDones[idx] = anyMatchDone ? 1U : 0U;
-        }
+        if (!outDealDones.empty()) outDealDones[idx] = anyDealDone ? 1U : 0U;
+        if (!outMatchDones.empty()) outMatchDones[idx] = anyMatchDone ? 1U : 0U;
         if (!outFinalScores.empty()) {
             int32_t* fPtr = outFinalScores.data() + idx * kNumPlayers;
             for (int p = 0; p < kNumPlayers; ++p) {
@@ -1041,9 +695,7 @@ void JokerVectorEnv::StepArena(
         if (!outNextObsBatch.empty()) {
             env.WriteObservationTensor(hero, outNextObsBatch.data() + idx * kObsStride);
         }
-        if (!outNextMasks.empty()) {
-            outNextMasks[idx] = env.GetLegalActionsMask();
-        }
+        if (!outNextMasks.empty()) outNextMasks[idx] = env.GetLegalActionsMask();
         if (!outNextOracleBatch.empty()) {
             WriteOracleTensor(env.GetState(), hero, outNextOracleBatch.data() + idx * kOracleTensorSize);
         }

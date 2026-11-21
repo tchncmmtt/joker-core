@@ -1,7 +1,7 @@
 # Joker Core Engine (`C++23`) — Архитектура и документация API
 
 Высокопроизводительное ядро карточной игры «Джокер» на стандарте **C++23**, спроектированное для:
-* **живого стола (Observed / Live Table Mode):** ввод реальных раздач, строгая валидация правил с кодами ошибок (`JokerStepError`), откат (`Undo`) и подсказка хода от любого бота;
+* **живого стола (Observed / Live Table Mode):** ввод реальных раздач (с начала или с середины партии), строгая валидация правил с кодами ошибок (`JokerStepError`), откат (`Undo`) и подсказка хода от любого бота;
 * **массового обучения с подкреплением** (PPO, IMPALA, MAPPO, AlphaZero) через многопоточный батчинг (**OpenMP**) с производительностью ≥ 10 000 партий/сек;
 * **нейросетевых архитектур** (**MLP, ResNet, LSTM, Transformers**) и **Asymmetric Actor-Critic**;
 * **арены и бенчмаркинга ботов:** встроенная C++ эвристика (`HeuristicBot`), сбор статистики (`JokerPlayerStats`) без блокировок и зеркальные турниры (Duplicate Matches);
@@ -20,11 +20,15 @@ joker-core/
 │   │   ├── Action.hpp         # Каноническое пространство действий (0..45)
 │   │   ├── Deck.hpp           # xoshiro256** + тасование Лемира без modulo bias
 │   │   ├── Rules.hpp          # Легальные ходы, валидация, взятки и подсчёт очков
-│   │   └── GameState.hpp      # 192-байтное состояние партии и тензор v2 (320 float)
+│   │   └── GameState.hpp      # 192-байтное состояние партии и GameStateView
 │   ├── engine/
-│   │   ├── JokerEngine.hpp    # Тривиально копируемый конечный автомат партии
+│   │   ├── ArenaStats.hpp     # Lock-free SlotStats и агрегация JokerPlayerStats
+│   │   ├── DealHistory.hpp    # DealHistoryBuffer ([48, 8] int16) для Transformer/LSTM
+│   │   ├── Determinizer.hpp   # 3-проходный BFS-солвер детерминизации по impossibleCards
 │   │   ├── HeuristicBot.hpp   # Быстрая 3-фазная безаллокационная C++ эвристика
-│   │   └── JokerVectorEnv.hpp # OpenMP-пул сред, DealHistoryBuffer, Oracle, Fork, Stats
+│   │   ├── JokerEngine.hpp    # Тривиально копируемый конечный автомат партии
+│   │   ├── JokerVectorEnv.hpp # OpenMP-пул сред, StepBatch, StepArena, Fork
+│   │   └── TensorEncoder.hpp  # Кодировщик тензора v2 (320 float) и Oracle (160 float)
 │   └── joker_c_api.h          # Чистый C ABI (Zero-Copy) для Python / Rust / C# / WASM
 ├── src/
 │   ├── core/
@@ -32,9 +36,13 @@ joker-core/
 │   │   ├── Deck.cpp
 │   │   └── GameState.cpp
 │   ├── engine/
+│   │   ├── ArenaStats.cpp
+│   │   ├── DealHistory.cpp
+│   │   ├── Determinizer.cpp
 │   │   ├── HeuristicBot.cpp
 │   │   ├── JokerEngine.cpp
-│   │   └── JokerVectorEnv.cpp
+│   │   ├── JokerVectorEnv.cpp
+│   │   └── TensorEncoder.cpp
 │   ├── joker_c_api.cpp
 │   └── main_cli.cpp
 └── CMakeLists.txt
@@ -145,7 +153,7 @@ joker-core/
 * `318`: `winningCardsInMyHand / max(1, handSize)`; `319`: `losingCardsInMyHand / max(1, handSize)`.
 
 ### 4.2. Oracle-тензор (`160 float`) и история сдачи (`[48, 8] int16`)
-* **Oracle (`160 float`):** `0..151` (`4 × 38`) — истинные карты всех 4 игроков в эгоцентричном порядке; `152..159` — выравнивание.
+* **Oracle (`160 float`):** `0..151` (`4 × 38`) — истинные карты всех 4 игроков в эгоцентричном порядке; `152..159` — выравнивание (для критика в Asymmetric Actor-Critic).
 * **DealHistoryBuffer (`[48, 8] int16`):** хронологическая последовательность событий сдачи (доступна и в `JokerVectorEnv`, и в Single-Env через `joker_write_history_tokens`). Значение `0` во всех 8 колонках строго зарезервировано под `PAD`:
   `[eventType(1..3), relSeat(1..4), actionId+1(1..46), cardId+1(0..38), suit+1(0..5), jokerAction+1(0..5), trickIdx+1(0..9), posInTrick+1(0..4)]`.
 
@@ -157,19 +165,20 @@ joker-core/
 * при ренонсе по требуемой масти исключается вся масть (и вся козырная масть, если игрок не бил козырем);
 * при ходе Джокером `LeadHighSuit` все карты требуемой масти (или козыря, если игрок бил козырем при ренонсе) **строго старше** сыгранной карты заносятся в `impossibleCards[p]`.
 
-`JokerEngine::Determinize(observer, seed)` использует `impossibleCards` и счётчики `handCounts[4]` (включая Observed Mode) через 3-проходный безаллокационный солвер: жадный обмен → парный обмен → точный **BFS по дополняющим циклам** среди 4 корзин на стеке.
+`DeterminizeState` (`Determinizer.cpp`) использует `impossibleCards` и счётчики `handCounts[4]` (включая Observed Mode) через 3-проходный безаллокационный солвер: жадный обмен → парный обмен → точный **BFS по дополняющим циклам** среди 4 корзин на стеке.
 
 ---
 
 ## 6. Режим живого стола (Observed Mode), валидация и `Undo`
 
 Протокол ведения реального стола через `JokerEnvHandle`:
-1. `joker_begin_observed_match(env, rules, mode, team, pulka, dealer, hero_seat)` — переводит движок в частичную наблюдаемость (`knownHandsMask = 1 << hero_seat`).
-2. `joker_set_observed_deal(env, hero_hand_mask, upcard_or_invalid, trump_suit_or_none)` — ввод карт героя (3 карты на девятках с гаданием или полную руку) и вскрытого козыря.
-3. На девятках после `ChoosingTrump` вызывается `joker_set_observed_remaining_six(env, full_nine_hand_mask)`.
-4. Ходы проверяются через `joker_validate_action` / `joker_step_checked`, возвращающие `JokerStepError` (`0 = JOKER_ERR_OK` .. `14 = JOKER_ERR_NO_JOKER_AVAILABLE`).
-5. Любой ошибочный ввод откатывается через `joker_undo(env)` (кольцевой буфер на 64 снимка, глубина — `joker_can_undo_steps`).
-6. В любой момент `joker_vec_fork_from_env` клонирует живой стол в пул `JokerVectorEnv` с детерминизацией рук соперников и копированием `DealHistoryBuffer` для подсказки нейросети/MCTS.
+1. Старт с первой сдачи — `joker_begin_observed_match(env, rules, mode, team, pulka, dealer, hero_seat)`, либо вход в **середину** чужой партии — `joker_set_observed_match_state(...)` (передаются `deal_number`, `dealer`, `hero_seat`, текущие счета и трекеры текущей пульки).
+2. Состояние ожидания ввода читается через `JokerSnapshot::observed_flags` (`JOKER_OBS_FLAG_WAITING_DEAL = 1`, `JOKER_OBS_FLAG_WAITING_REM_SIX = 2`) и `JokerSnapshot::hero_seat`.
+3. `joker_set_observed_deal(env, hero_hand_mask, upcard_or_invalid, trump_suit_or_none)` — ввод карт героя (3 карты на девятках с гаданием или полную руку) и вскрытого козыря.
+4. На девятках после `ChoosingTrump` вызывается `joker_set_observed_remaining_six(env, full_nine_hand_mask)`.
+5. Ходы проверяются через `joker_validate_action` / `joker_step_checked`, возвращающие `JokerStepError` (`0 = JOKER_ERR_OK` .. `14 = JOKER_ERR_NO_JOKER_AVAILABLE`).
+6. Любой ошибочный ввод откатывается через `joker_undo(env)` (кольцевой буфер на 64 снимка, глубина — `joker_can_undo_steps`).
+7. В любой момент `joker_vec_fork_from_env` клонирует живой стол в пул `JokerVectorEnv` с детерминизацией рук соперников и копированием `DealHistoryBuffer` для подсказки нейросети/MCTS.
 
 ---
 
@@ -177,7 +186,7 @@ joker-core/
 
 ### Одиночная среда (`JokerEnvHandle`)
 * **Жизненный цикл:** `joker_create`, `joker_destroy`, `joker_clone`, `joker_clone_determinized`, `joker_determinize_inplace`, `joker_reset`, `joker_reset256`, `joker_force_deck_order`.
-* **Observed Mode:** `joker_begin_observed_match`, `joker_set_observed_deal`, `joker_set_observed_remaining_six`.
+* **Observed Mode:** `joker_begin_observed_match`, `joker_set_observed_match_state`, `joker_set_observed_deal`, `joker_set_observed_remaining_six`.
 * **Шаг, валидация, Undo:** `joker_step`, `joker_validate_action`, `joker_step_checked`, `joker_undo`, `joker_can_undo_steps`.
 * **Наблюдения и бот:** `joker_get_legal_actions_mask`, `joker_write_observation_tensor`, `joker_write_history_tokens`, `joker_select_heuristic_action`, `joker_get_snapshot`, `joker_get_total_scores`, `joker_get_team_scores`.
 * **Размерности:** `joker_tensor_size() == 320`, `joker_oracle_tensor_size() == 160`, `joker_history_seq_len() == 48`, `joker_history_token_dim() == 8`.

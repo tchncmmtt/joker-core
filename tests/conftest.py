@@ -69,6 +69,8 @@ class JokerSnapshot(ctypes.Structure):
         ("trick_cards", ctypes.c_uint8 * 4),
         ("trick_joker_actions", ctypes.c_uint8 * 4),
         ("trick_req_suits", ctypes.c_uint8 * 4),
+        ("observed_flags", ctypes.c_uint8),
+        ("hero_seat", ctypes.c_uint8),
     ]
 
 
@@ -139,6 +141,17 @@ lib.joker_force_deck_order.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_
 lib.joker_begin_observed_match.argtypes = [
     ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8
 ]
+lib.joker_set_observed_match_state.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8,
+    ctypes.c_int32, ctypes.c_uint8, ctypes.c_uint8,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(ctypes.c_int16),
+    ctypes.POINTER(ctypes.c_int16),
+]
+lib.joker_set_observed_match_state.restype = ctypes.c_int
 lib.joker_set_observed_deal.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctypes.c_uint8]
 lib.joker_set_observed_deal.restype = ctypes.c_int
 lib.joker_set_observed_remaining_six.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
@@ -241,6 +254,10 @@ RANK_JACK, RANK_QUEEN, RANK_KING, RANK_ACE = RANK_J, RANK_Q, RANK_K, RANK_A
 
 JK1, JK2 = 36, 37
 INVALID_CARD = 255
+
+# Флаги JokerSnapshot.observed_flags
+JOKER_OBS_FLAG_WAITING_DEAL = 1 << 0
+JOKER_OBS_FLAG_WAITING_REM_SIX = 1 << 1
 
 # Канонические ActionId Джокера (синхронизировано с Action.hpp)
 ACT_JOKER_PLAY_WIN = 36

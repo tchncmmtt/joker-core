@@ -1,4 +1,5 @@
 #include "joker_c_api.h"
+#include "engine/DealHistory.hpp"
 #include "engine/JokerEngine.hpp"
 #include "engine/JokerVectorEnv.hpp"
 #include <array>
@@ -213,6 +214,47 @@ void joker_begin_observed_match(
     env->ClearHistoryAndUndo();
 }
 
+int joker_set_observed_match_state(
+    JokerEnvHandle* env,
+    uint8_t rules_preset,
+    uint8_t match_mode,
+    uint8_t team_mode,
+    uint8_t pulka_mode,
+    int32_t deal_number,
+    uint8_t dealer,
+    uint8_t hero_seat,
+    const int32_t total_scores4[4],
+    const uint8_t pulka_clean4[4],
+    const uint8_t pulka_all_passes4[4],
+    const int16_t pulka_max_score_excl_last4[4],
+    const int16_t pulka_max_non_pass_score_excl_last4[4]) {
+    if (!env || !total_scores4 || !pulka_clean4 || !pulka_all_passes4 ||
+        !pulka_max_score_excl_last4 || !pulka_max_non_pass_score_excl_last4) {
+        return 0;
+    }
+
+    const bool ok = env->engine.SetObservedMatchState(
+        ParseRulePreset(rules_preset),
+        ParseMatchMode(match_mode),
+        ParseTeamMode(team_mode),
+        ParsePulkaMode(pulka_mode),
+        deal_number,
+        dealer % 4U,
+        hero_seat % 4U,
+        std::span<const int32_t, 4>(total_scores4, 4),
+        std::span<const uint8_t, 4>(pulka_clean4, 4),
+        std::span<const uint8_t, 4>(pulka_all_passes4, 4),
+        std::span<const int16_t, 4>(pulka_max_score_excl_last4, 4),
+        std::span<const int16_t, 4>(pulka_max_non_pass_score_excl_last4, 4));
+
+    if (!ok) {
+        return 0;
+    }
+
+    env->ClearHistoryAndUndo();
+    return 1;
+}
+
 int joker_set_observed_deal(
     JokerEnvHandle* env,
     uint64_t hero_hand_mask,
@@ -362,6 +404,8 @@ void joker_get_snapshot(const JokerEnvHandle* env, JokerSnapshot* s) {
     s->trump_suit = std::to_underlying(st.trumpSuit);
     s->upcard = st.upcard;
     s->cards_in_trick = st.cardsInCurrentTrick;
+    s->observed_flags = st.observedFlags;
+    s->hero_seat = st.heroSeat;
 
     for (int i = 0; i < 4; ++i) {
         s->hands[i] = st.hands[i];

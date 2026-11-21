@@ -4,18 +4,18 @@
 #include <stdint.h>
 
 #if defined(__EMSCRIPTEN__)
-#  include <emscripten/emscripten.h>
-#  define JOKER_API EMSCRIPTEN_KEEPALIVE
+# include <emscripten/emscripten.h>
+# define JOKER_API EMSCRIPTEN_KEEPALIVE
 #elif defined(_WIN32)
-#  if defined(JOKER_CORE_STATIC)
-#    define JOKER_API
-#  elif defined(JOKER_CORE_EXPORTS)
-#    define JOKER_API __declspec(dllexport)
-#  else
-#    define JOKER_API __declspec(dllimport)
-#  endif
+# if defined(JOKER_CORE_STATIC)
+#  define JOKER_API
+# elif defined(JOKER_CORE_EXPORTS)
+#  define JOKER_API __declspec(dllexport)
+# else
+#  define JOKER_API __declspec(dllimport)
+# endif
 #else
-#  define JOKER_API __attribute__((visibility("default")))
+# define JOKER_API __attribute__((visibility("default")))
 #endif
 
 #ifdef __cplusplus
@@ -27,14 +27,14 @@ typedef struct JokerVecEnvHandle JokerVecEnvHandle;
 
 // ============================================================================
 // Каноническая нумерация ActionId (всего 46 действий: 0..45)
-//   Phase::ChoosingTrump (0): 0=♠, 1=♣, 2=♦, 3=♥, 4=Б/К (None)
-//   Phase::Bidding       (1): 0..cards_in_deal (количество взяток; висяк дилера снят)
-//   Phase::TrickPlay     (2):
-//     0..35  : обычная карта (CardId = suit*9 + rank; 6♠=0 и 6♣=9 не в 36-карточной колоде)
-//     36     : Джокер PlayWin (ответ во взятку: побить)
-//     37     : Джокер PlayLow (ответ во взятку: сбросить по дну)
-//     38..41 : Джокер LeadHighSuit (первый ход по высшей масти: 38=♠, 39=♣, 40=♦, 41=♥)
-//     42..45 : Джокер LeadLow      (первый ход по меньшей масти: 42=♠, 43=♣, 44=♦, 45=♥)
+// Phase::ChoosingTrump (0): 0=♠, 1=♣, 2=♦, 3=♥, 4=Б/К (None)
+// Phase::Bidding (1): 0..cards_in_deal (количество взяток; висяк дилера снят)
+// Phase::TrickPlay (2):
+//   0..35  : обычная карта (CardId = suit*9 + rank; 6♠=0 и 6♣=9 не в 36-карточной колоде)
+//   36     : Джокер PlayWin (ответ во взятку: побить)
+//   37     : Джокер PlayLow (ответ во взятку: сбросить по дну)
+//   38..41 : Джокер LeadHighSuit (первый ход по высшей масти: 38=♠, 39=♣, 40=♦, 41=♥)
+//   42..45 : Джокер LeadLow (первый ход по меньшей масти: 42=♠, 43=♣, 44=♦, 45=♥)
 // ============================================================================
 
 typedef enum {
@@ -54,6 +54,11 @@ typedef enum {
     JOKER_ERR_VIOLATES_KNOWN_VOID_OR_BOUND = 13,
     JOKER_ERR_NO_JOKER_AVAILABLE = 14
 } JokerStepError;
+
+// Битовые флаги JokerSnapshot::observed_flags:
+// 0 = готов к шагу, 1 = ждёт joker_set_observed_deal, 2 = ждёт joker_set_observed_remaining_six
+#define JOKER_OBS_FLAG_WAITING_DEAL    (1U << 0)
+#define JOKER_OBS_FLAG_WAITING_REM_SIX (1U << 1)
 
 // ============================================================================
 // 1. Одиночная среда (Single-Env API + Observed Mode + Undo + ISMCTS / PIMC)
@@ -113,6 +118,26 @@ JOKER_API void joker_begin_observed_match(
     uint8_t dealer,
     uint8_t hero_seat
 );
+
+// Вход в середину уже идущей внешней партии (deal_number: 0..23 для Long, 0..7 для Short).
+// После вызова движок ждёт joker_set_observed_deal для текущей сдачи.
+// Возвращает 1 при успехе, 0 при невалидных параметрах.
+JOKER_API int joker_set_observed_match_state(
+    JokerEnvHandle* env,
+    uint8_t rules_preset,
+    uint8_t match_mode,
+    uint8_t team_mode,
+    uint8_t pulka_mode,
+    int32_t deal_number,
+    uint8_t dealer,
+    uint8_t hero_seat,
+    const int32_t total_scores4[4],
+    const uint8_t pulka_clean4[4],
+    const uint8_t pulka_all_passes4[4],
+    const int16_t pulka_max_score_excl_last4[4],
+    const int16_t pulka_max_non_pass_score_excl_last4[4]
+);
+
 // Возвращает 1 при успехе, 0 при невалидных входных данных.
 // upcard_or_invalid: 0..37 или 255 (нет вскрытой карты / девятки с гаданием).
 // trump_suit_or_none: 0..4 (или 255 для автовывода из upcard).
@@ -122,6 +147,7 @@ JOKER_API int joker_set_observed_deal(
     uint8_t upcard_or_invalid,
     uint8_t trump_suit_or_none
 );
+
 // Возвращает 1 при успехе, 0 при невалидных данных (проверяет подмножество прежних 3 карт и размер 9).
 JOKER_API int joker_set_observed_remaining_six(
     JokerEnvHandle* env,
@@ -150,10 +176,10 @@ JOKER_API void joker_write_history_tokens(
 // Встроенная быстрая C++ эвристика
 JOKER_API uint8_t joker_select_heuristic_action(const JokerEnvHandle* env, uint64_t rng_seed);
 
-JOKER_API size_t joker_tensor_size(void);        // 320 floats
-JOKER_API size_t joker_oracle_tensor_size(void); // 160 floats
-JOKER_API size_t joker_history_seq_len(void);    // 48 шагов в сдаче
-JOKER_API size_t joker_history_token_dim(void);  // 8 int16 признаков на шаг
+JOKER_API size_t joker_tensor_size(void);         // 320 floats
+JOKER_API size_t joker_oracle_tensor_size(void);  // 160 floats
+JOKER_API size_t joker_history_seq_len(void);     // 48 шагов в сдаче
+JOKER_API size_t joker_history_token_dim(void);   // 8 int16 признаков на шаг
 
 JOKER_API void joker_write_observation_tensor(
     const JokerEnvHandle* env,
@@ -168,28 +194,30 @@ JOKER_API int32_t joker_get_deal_number(const JokerEnvHandle* env);
 typedef struct {
     uint64_t hands[4];
     uint64_t played_cards;
-    int32_t  deal_number;
-    int32_t  cards_in_deal;
-    int32_t  bids[4];
-    int32_t  tricks_taken[4];
-    int32_t  total_scores[4];
-    uint8_t  rules;
-    uint8_t  match_mode;
-    uint8_t  team_mode;
-    uint8_t  pulka_mode;
-    uint8_t  phase;
-    uint8_t  dealer;
-    uint8_t  current_player;
-    uint8_t  trick_leader;
-    uint8_t  last_trick_winner;
-    uint8_t  trump_suit;
-    uint8_t  upcard;
-    uint8_t  cards_in_trick;
-    uint8_t  pulka_clean[4];
-    uint8_t  trick_players[4];
-    uint8_t  trick_cards[4];
-    uint8_t  trick_joker_actions[4];
-    uint8_t  trick_req_suits[4];
+    int32_t deal_number;
+    int32_t cards_in_deal;
+    int32_t bids[4];
+    int32_t tricks_taken[4];
+    int32_t total_scores[4];
+    uint8_t rules;
+    uint8_t match_mode;
+    uint8_t team_mode;
+    uint8_t pulka_mode;
+    uint8_t phase;
+    uint8_t dealer;
+    uint8_t current_player;
+    uint8_t trick_leader;
+    uint8_t last_trick_winner;
+    uint8_t trump_suit;
+    uint8_t upcard;
+    uint8_t cards_in_trick;
+    uint8_t pulka_clean[4];
+    uint8_t trick_players[4];
+    uint8_t trick_cards[4];
+    uint8_t trick_joker_actions[4];
+    uint8_t trick_req_suits[4];
+    uint8_t observed_flags;
+    uint8_t hero_seat;
 } JokerSnapshot;
 
 JOKER_API void joker_get_snapshot(const JokerEnvHandle* env, JokerSnapshot* out_snap);
@@ -208,22 +236,22 @@ typedef struct {
 
 // Статистика игрока за местом 0..3 для Арены.
 // Правило распределения мест при ничьей:
-//   - Solo: competition ranking (place_counts[strictly_better]++);
-//           place_points += (strictly_better == 0) ? (1.0 / tied_for_first) : 0.0.
-//   - Pairs: победившая пара получает place_counts[0]++ и place_points += 1.0,
-//           проигравшая — place_counts[1]++; при ничьей все 4 получают place_counts[0]++ и 0.5.
+// - Solo: competition ranking (place_counts[strictly_better]++);
+//   place_points += (strictly_better == 0) ? (1.0 / tied_for_first) : 0.0.
+// - Pairs: победившая пара получает place_counts[0]++ и place_points += 1.0,
+//   проигравшая — place_counts[1]++; при ничьей все 4 получают place_counts[0]++ и 0.5.
 typedef struct {
     uint64_t matches_played;
     uint64_t place_counts[4];
-    double   place_points;
-    int64_t  total_match_score_sum;
-    double   total_match_score_sq_sum;
-    int32_t  max_match_score;
-    int32_t  min_match_score;
+    double place_points;
+    int64_t total_match_score_sum;
+    double total_match_score_sq_sum;
+    int32_t max_match_score;
+    int32_t min_match_score;
 
     uint64_t deals_played;
-    int32_t  max_deal_score;
-    int32_t  min_deal_score;
+    int32_t max_deal_score;
+    int32_t min_deal_score;
     uint64_t exact_bids;
     uint64_t overbids;
     uint64_t underbids;

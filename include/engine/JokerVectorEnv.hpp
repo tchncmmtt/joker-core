@@ -1,6 +1,9 @@
 #pragma once
 
+#include "engine/ArenaStats.hpp"
+#include "engine/DealHistory.hpp"
 #include "engine/JokerEngine.hpp"
+#include "engine/TensorEncoder.hpp"
 #include "joker_c_api.h"
 #include <array>
 #include <cstddef>
@@ -18,41 +21,6 @@ struct RewardConfig {
     float trickWinShaping{0.0f};
 };
 
-struct DealHistoryBuffer {
-    static constexpr size_t kMaxSeqLen = 48;
-    static constexpr size_t kTokenDim = 8;
-
-    struct RawEvent {
-        uint8_t eventType{0};
-        uint8_t absPlayer{0};
-        uint8_t actionId{0};
-        uint8_t cardId{255};
-        uint8_t suit{4};
-        uint8_t jokerAction{0};
-        uint8_t trickIdx{255};
-        uint8_t posInTrick{255};
-    };
-
-    std::array<RawEvent, kMaxSeqLen> events{};
-    uint8_t count{0};
-
-    constexpr void Clear() noexcept {
-        count = 0;
-    }
-
-    constexpr void Push(const RawEvent& ev) noexcept {
-        if (count < kMaxSeqLen) {
-            events[count++] = ev;
-        }
-    }
-
-    [[nodiscard]] static RawEvent MakeEvent(
-        const core::GameState& stBefore,
-        core::ActionId action) noexcept;
-
-    void WriteTokens(core::PlayerId observer, int16_t* outTokens, uint8_t* outLength) const noexcept;
-};
-
 struct alignas(64) EnvSlot {
     JokerEngine engine{};
     uint64_t episodeCounter{0};
@@ -60,16 +28,9 @@ struct alignas(64) EnvSlot {
     DealHistoryBuffer history{};
 };
 
-struct alignas(64) SlotStats {
-    std::array<JokerPlayerStats, core::kNumPlayers> players{};
-    std::array<uint8_t, core::kNumPlayers> matchBonusesCount{};
-
-    void Reset() noexcept;
-};
-
 class JokerVectorEnv {
 public:
-    static constexpr size_t kOracleTensorSize = 160;
+    static constexpr size_t kOracleTensorSize = joker::engine::kOracleTensorSize;
 
     JokerVectorEnv(
         size_t numEnvs,
@@ -171,21 +132,6 @@ public:
 private:
     void GenerateEnvSeed256(size_t envIdx, uint64_t episodeIdx, uint64_t outSeed[4]) const noexcept;
 
-    void RecordStepStats(
-        size_t envIdx,
-        core::Phase prevPhase,
-        core::PlayerId actor,
-        core::ActionId action,
-        int prevDeal,
-        int prevCardsInDeal,
-        const std::array<int8_t, core::kNumPlayers>& prevBids,
-        const std::array<int8_t, core::kNumPlayers>& finalDealTricks,
-        const std::array<int32_t, core::kNumPlayers>& prevScores,
-        const std::array<int32_t, core::kNumPlayers>& afterScores,
-        const std::array<bool, core::kNumPlayers>& prevPulkaClean,
-        bool dealDone,
-        bool matchDone) noexcept;
-
     void ComputeStepRewards(
         const std::array<int32_t, core::kNumPlayers>& prevScores,
         const std::array<int32_t, core::kNumPlayers>& afterScores,
@@ -196,11 +142,6 @@ private:
         bool dealDone,
         bool matchDone,
         std::array<float, core::kNumPlayers>& outStepRewards) const noexcept;
-
-    static void WriteOracleTensor(
-        const core::GameState& state,
-        core::PlayerId observer,
-        float* outOracle) noexcept;
 
     std::vector<EnvSlot> slots_;
     std::vector<SlotStats> slotStats_;

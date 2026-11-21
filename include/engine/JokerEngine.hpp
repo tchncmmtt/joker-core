@@ -38,6 +38,21 @@ public:
                             core::PlayerId dealer,
                             core::PlayerId heroSeat) noexcept;
 
+    // Старт режима живого стола с произвольной сдачи (вход в середину чужой партии)
+    [[nodiscard]] bool SetObservedMatchState(
+        core::RulePreset preset,
+        core::MatchMode mode,
+        core::TeamMode teamMode,
+        core::PulkaMode pulkaMode,
+        int dealNumber,
+        core::PlayerId dealer,
+        core::PlayerId heroSeat,
+        std::span<const int32_t, core::kNumPlayers> totalScores,
+        std::span<const uint8_t, core::kNumPlayers> pulkaClean,
+        std::span<const uint8_t, core::kNumPlayers> pulkaAllPasses,
+        std::span<const int16_t, core::kNumPlayers> pulkaMaxScoreExclLast,
+        std::span<const int16_t, core::kNumPlayers> pulkaMaxNonPassScoreExclLast) noexcept;
+
     [[nodiscard]] bool SetObservedDeal(core::HandMask heroHandMask,
                                        core::CardId upcardOrInvalid,
                                        uint8_t trumpSuitOrNone) noexcept;
